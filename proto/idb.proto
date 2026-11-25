@@ -1140,6 +1140,17 @@ message VideoStreamRequest {
     MJPEG = 2;
     MINICAP = 3;
     I420 = 4;
+    // H.265 as an Annex-B byte stream.
+    HEVC = 5;
+  }
+  // How the encoded frames reach the client.
+  enum Transport {
+    // As `payload` responses on this call.
+    GRPC = 0;
+    // On a QUIC connection of their own, one unidirectional stream per frame.
+    // The first response on this call is a `quic_session` saying where to
+    // connect; the call stays open as the session's control channel.
+    QUIC = 1;
   }
   message Start {
     string file_path = 1;
@@ -1149,18 +1160,36 @@ message VideoStreamRequest {
     double scale_factor = 5;
     double avg_bitrate = 6;
     double key_frame_rate = 7;
+    Transport transport = 8;
+    // QUIC only: the UDP port the session listens on. Zero picks a free one.
+    uint32 quic_port = 9;
   }
   message Stop {}
+  // Asks for the next encoded frame to be a keyframe, so a client that lost
+  // frames can resume decoding without waiting for the periodic one.
+  message KeyFrame {}
   oneof control {
     Start start = 1;
     Stop stop = 2;
+    KeyFrame key_frame = 3;
   }
 }
 
 message VideoStreamResponse {
+  // Where to connect for a QUIC transport stream. The companion presents a
+  // self-signed certificate made for this session: the client must accept it
+  // only if its DER encoding hashes to `certificate_sha256`, then open a
+  // bidirectional stream and send `token` before any frame is sent.
+  message QuicSession {
+    uint32 port = 1;
+    bytes certificate_sha256 = 2;
+    bytes token = 3;
+    string alpn = 4;
+  }
   oneof output {
     bytes log_output = 1;
     Payload payload = 2;
+    QuicSession quic_session = 3;
   }
 }
 

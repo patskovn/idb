@@ -19,4 +19,17 @@ public protocol VideoStreamOperation: AnyObject, Sendable {
 
   /// Waits for the stream to complete (returns once it has stopped).
   func awaitCompletion() async throws
+
+  /// Asks for the next encoded frame to be a keyframe, so a consumer that joined late or lost
+  /// frames can resume decoding. Fire-and-forget; a stream with no keyframes ignores it.
+  func requestKeyFrame()
+
+  /// Changes the encoder's average bitrate, for rate adaptation. Fire-and-forget; a stream without a
+  /// bitrate ignores it.
+  func setAverageBitRate(_ bitsPerSecond: Int)
+}
+
+public extension VideoStreamOperation {
+  func requestKeyFrame() {}
+  func setAverageBitRate(_ bitsPerSecond: Int) {}
 }

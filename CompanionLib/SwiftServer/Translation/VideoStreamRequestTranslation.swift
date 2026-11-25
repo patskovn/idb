@@ -37,6 +37,8 @@ enum VideoStreamRequestTranslation {
     switch requestFormat {
     case .h264:
       return .compressedVideo(withCodec: .h264, transport: .annexB)
+    case .hevc:
+      return .compressedVideo(withCodec: .hevc, transport: .annexB)
     case .rbga:
       return .bgra
     case .mjpeg:

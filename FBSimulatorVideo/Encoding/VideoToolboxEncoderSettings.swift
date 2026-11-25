@@ -217,3 +217,30 @@ struct VideoToolboxEncoderSettings {
     ]
   }
 }
+
+/// Encoder settings an experiment can add without a rebuild, read from the companion's environment
+/// as JSON objects keyed by VideoToolbox property name (the key constants' string values, e.g.
+/// `{"ConstantBitRate": 3000000}` or `{"DataRateLimits": [100000, 0.25]}`):
+/// `IDB_VT_PROPERTIES` for session properties, `IDB_VT_SPECIFICATION` for the encoder specification.
+/// Only compressed video (H.264/HEVC) uses them.
+struct VideoToolboxExperimentOverrides {
+  var properties: [String: Any]?
+  var specification: [String: Any]?
+
+  static func fromEnvironment(format: VideoStreamFormat) -> VideoToolboxExperimentOverrides {
+    guard case .compressedVideo = format else {
+      return VideoToolboxExperimentOverrides()
+    }
+    let environment = ProcessInfo.processInfo.environment
+    return VideoToolboxExperimentOverrides(
+      properties: environment["IDB_VT_PROPERTIES"].flatMap(object(fromJSON:)),
+      specification: environment["IDB_VT_SPECIFICATION"].flatMap(object(fromJSON:)))
+  }
+
+  private static func object(fromJSON json: String) -> [String: Any]? {
+    guard let data = json.data(using: .utf8) else {
+      return nil
+    }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+  }
+}

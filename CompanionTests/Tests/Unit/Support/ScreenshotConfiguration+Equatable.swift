@@ -10,7 +10,7 @@
 // FBControlCore does not compare screenshot configurations, so it does not carry these conformances;
 // the translation tests compare whole values, so they declare them here.
 
-extension ScreenshotScale: @retroactive Equatable {
+extension ScreenshotScale: Equatable {
   public static func == (lhs: ScreenshotScale, rhs: ScreenshotScale) -> Bool {
     switch (lhs, rhs) {
     case (.native, .native):
@@ -27,7 +27,7 @@ extension ScreenshotScale: @retroactive Equatable {
   }
 }
 
-extension ScreenshotConfiguration: @retroactive Equatable {
+extension ScreenshotConfiguration: Equatable {
   public static func == (lhs: ScreenshotConfiguration, rhs: ScreenshotConfiguration) -> Bool {
     lhs.encoding == rhs.encoding
       && lhs.cropRect == rhs.cropRect

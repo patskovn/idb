@@ -105,7 +105,12 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
   }
 
   func setup(source: VideoFrameSource, edgeInsets: VideoStreamEdgeInsets) throws {
-    let encoderSpecification = settings.encoderSpecification
+    var encoderSpecification = settings.encoderSpecification
+    let experimentOverrides = VideoToolboxExperimentOverrides.fromEnvironment(format: settings.format)
+    if let specification = experimentOverrides.specification {
+      encoderSpecification.merge(specification) { _, override in override }
+      logger.log("Experiment: encoder specification overrides \(specification)")
+    }
 
     let sourceWidth = source.width
     let sourceHeight = source.height
@@ -166,6 +171,11 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
     if propertiesStatus != noErr {
       throw VideoToolboxFramePusherError.failedToSetCompressionSessionProperties(status: propertiesStatus)
     }
+    // One at a time so an unsupported key is reported rather than failing the stream.
+    for (key, value) in experimentOverrides.properties ?? [:] {
+      let status = VTSessionSetProperty(compressionSession, key: key as CFString, value: value as CFTypeRef)
+      logger.log("Experiment: set \(key) = \(value) -> \(status == noErr ? "ok" : "failed (\(status))")")
+    }
     let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(compressionSession)
     if prepareStatus != noErr {
       throw VideoToolboxFramePusherError.failedToPrepareCompressionSession(status: prepareStatus)
@@ -196,6 +206,8 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
 
     var bufferToWrite = pixelBuffer
 
+    // On the encoded sample for timing-aware consumers (latency tracing, the QUIC frame header).
+    let submittedAt = DispatchTime.now().uptimeNanoseconds
     let encodeStart = ContinuousClock.now
     statsRecorder.recordSubmissionStarting(at: encodeStart)
 
@@ -219,10 +231,14 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
       frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
     }
 
+    let encodeCalledAt = DispatchTime.now().uptimeNanoseconds
     // `[weak self]`: the session does not retain the pusher, so a strong capture would be a cycle
     // (pusher → session → handler → pusher). The handler may run on a VideoToolbox thread after this
     // call returns (see the class doc).
     let handler: VTCompressionOutputHandler = { [weak self] encodeStatus, infoFlags, sampleBuffer in
+      if let sampleBuffer {
+        EncodedFrameTimingAttachment.attach(submittedAtUptimeNanos: submittedAt, encodeCalledAtUptimeNanos: encodeCalledAt, to: sampleBuffer)
+      }
       self?.handleCompressedSampleBuffer(sampleBuffer, encodeStatus: encodeStatus, infoFlags: infoFlags)
     }
 
@@ -271,6 +287,20 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
   func completeFrames() {
     if let compressionSession {
       VTCompressionSessionCompleteFrames(compressionSession, untilPresentationTimeStamp: .invalid)
+    }
+  }
+
+  func setAverageBitRate(_ bitsPerSecond: Int) {
+    guard let compressionSession else {
+      return
+    }
+    let properties: [String: Any] = [
+      kVTCompressionPropertyKey_AverageBitRate as String: bitsPerSecond,
+      kVTCompressionPropertyKey_DataRateLimits as String: [bitsPerSecond * 3 / 16, 1],
+    ]
+    let status = VTSessionSetProperties(compressionSession, propertyDictionary: properties as CFDictionary)
+    if status != noErr {
+      logger.log("Failed to set the average bitrate to \(bitsPerSecond): \(status)")
     }
   }
 

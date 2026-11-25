@@ -23,7 +23,8 @@ let package = Package(
     .macOS(.v15)
   ],
   products: [
-    .executable(name: "idb-repl", targets: ["idb-repl"])
+    .executable(name: "idb-repl", targets: ["idb-repl"]),
+    .executable(name: "idb-video", targets: ["idb-video"]),
   ],
   dependencies: [
     .package(url: "https://github.com/grpc/grpc-swift-2.git", exact: "2.4.3"),
@@ -98,6 +99,19 @@ let package = Package(
       plugins: [
         "GenerateBuildInfo"
       ]
+    ),
+    // Streams a simulator's screen from idb_companion over QUIC
+    // (`swift build --product idb-video`). Pure Swift on IDBGRPCSwift and the
+    // system Network framework.
+    .executableTarget(
+      name: "idb-video",
+      dependencies: [
+        "IDBGRPCSwift",
+        .product(name: "GRPCCore", package: "grpc-swift-2"),
+        .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+      ],
+      path: "Tools/IDBVideo"
     ),
     .plugin(
       name: "GenerateBuildInfo",

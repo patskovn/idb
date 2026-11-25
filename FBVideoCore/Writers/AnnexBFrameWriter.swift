@@ -44,6 +44,17 @@ public struct AnnexBFrameWriter: EncodedFrameWriter {
       }
     }
     try dataBuffer.appendBytes(to: &frame)
-    consumer.consumeData(frame)
+    if let timedConsumer = consumer as? any TimedFrameConsumer {
+      let encodedAt = DispatchTime.now().uptimeNanoseconds
+      timedConsumer.consumeFrame(
+        frame,
+        timing: EncodedFrameTiming(
+          submittedAtUptimeNanos: EncodedFrameTimingAttachment.submittedAtUptimeNanos(of: sampleBuffer) ?? encodedAt,
+          encodeCalledAtUptimeNanos: EncodedFrameTimingAttachment.encodeCalledAtUptimeNanos(of: sampleBuffer),
+          encodedAtUptimeNanos: encodedAt,
+          isKeyFrame: isKeyFrame))
+    } else {
+      consumer.consumeData(frame)
+    }
   }
 }

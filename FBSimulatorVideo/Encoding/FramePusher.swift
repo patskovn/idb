@@ -30,9 +30,13 @@ protocol FramePusher: AnyObject {
   /// The source surface changed while the frame was being read; counted in the pusher's stats.
   func recordTornFrame()
   func currentStats() -> VideoEncoderStats?
+  /// Changes the encoder's average bitrate mid-stream, for rate adaptation. Ignored by pushers
+  /// without a bitrate.
+  func setAverageBitRate(_ bitsPerSecond: Int)
 }
 
 extension FramePusher {
+  func setAverageBitRate(_ bitsPerSecond: Int) {}
   func warm(with pixelBuffer: CVPixelBuffer) throws {}
   func completeFrames() {}
   func recordTornFrame() {}

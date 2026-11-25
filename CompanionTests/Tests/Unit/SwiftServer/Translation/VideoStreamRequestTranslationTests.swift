@@ -75,6 +75,7 @@ struct VideoStreamRequestTranslationTests {
   @Test
   func everyWireFormatMaps() {
     #expect(configuration { $0.format = .h264 }.format == .compressedVideo(withCodec: .h264, transport: .annexB))
+    #expect(configuration { $0.format = .hevc }.format == .compressedVideo(withCodec: .hevc, transport: .annexB))
     #expect(configuration { $0.format = .rbga }.format == .bgra)
     #expect(configuration { $0.format = .mjpeg }.format == .mjpeg(encoder: .requireHardware))
     #expect(configuration { $0.format = .minicap }.format == .minicap)

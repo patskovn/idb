@@ -204,6 +204,12 @@ public actor SimulatorVideoStream: VideoStreamOperation {
   private var presentedSurfaceSeed: UInt32?
   /// Whether the next triggered push must force the keyframe of an overlay swap whose own push was held back
   private var keyFrameHeldBack = false
+  /// A forced keyframe whose frame the consumer had no room for: the next frame pushed is a keyframe,
+  /// so a keyframe request is never lost to backpressure.
+  private var keyFrameOwed = false
+  /// In `.lazy` mode a frame dropped for backpressure is pushed again once there is room, so the last
+  /// state of the screen always reaches the consumer even if the screen then stays still.
+  private var retryAfterDropTask: Task<Void, Never>?
 
   var pixelBuffer: CVPixelBuffer?
   /// The mounted surface as the interface shows it.
@@ -490,6 +496,8 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     lazyTriggers = nil
     framePusherTask?.cancel()
     framePusherTask = nil
+    retryAfterDropTask?.cancel()
+    retryAfterDropTask = nil
   }
 
   // MARK: - Framebuffer Events
@@ -689,13 +697,21 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     }
   }
 
-  func pushFrame(forceKeyFrame: Bool) {
+  func pushFrame(forceKeyFrame requestedKeyFrame: Bool) {
     guard let pixelBuffer, let consumer, let framePusher else {
       return
     }
+    let forceKeyFrame = requestedKeyFrame || keyFrameOwed
     if !consumer.hasCapacityForFrame(logger: logger) {
+      // `IDB_VIDEO_LEGACY_BACKPRESSURE=1` restores the old behaviour (a dropped keyframe request is
+      // lost, a dropped frame is not pushed again) for before/after measurements.
+      if !Self.legacyBackpressure {
+        keyFrameOwed = forceKeyFrame
+        scheduleRetryAfterDrop()
+      }
       return
     }
+    keyFrameOwed = false
 
     // Uptime is monotonic; the wall clock steps under NTP and can hand the encoder (and a file
     // writer) a timestamp earlier than the previous frame's.
@@ -737,6 +753,25 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     }
 
     self.frameNumber = frameNumber + 1
+  }
+
+  private static var legacyBackpressure: Bool {
+    ProcessInfo.processInfo.environment["IDB_VIDEO_LEGACY_BACKPRESSURE"] == "1"
+  }
+
+  private func scheduleRetryAfterDrop() {
+    guard case .lazy = cadence, retryAfterDropTask == nil else {
+      return
+    }
+    retryAfterDropTask = Task { [weak self] in
+      try? await Task.sleep(for: .milliseconds(33))
+      await self?.retryDroppedFrame()
+    }
+  }
+
+  private func retryDroppedFrame() {
+    retryAfterDropTask = nil
+    pushFrame(forceKeyFrame: false)
   }
 
   /// Lays overlays out on the current canvas from now on, as it changes with rotations and switches between
@@ -906,6 +941,18 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     Task { [weak self] in
       await self?.pushFrame(forceKeyFrame: true)
     }
+  }
+
+  /// Changes the mounted encoder's average bitrate. `nonisolated` fire-and-forget, like
+  /// `requestKeyFrame`.
+  public nonisolated func setAverageBitRate(_ bitsPerSecond: Int) {
+    Task { [weak self] in
+      await self?.applyAverageBitRate(bitsPerSecond)
+    }
+  }
+
+  private func applyAverageBitRate(_ bitsPerSecond: Int) {
+    framePusher?.setAverageBitRate(bitsPerSecond)
   }
 
   // MARK: - Screenshot
