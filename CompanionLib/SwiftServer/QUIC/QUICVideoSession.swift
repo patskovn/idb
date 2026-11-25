@@ -150,7 +150,8 @@ struct QUICBackpressurePolicy: Equatable, CustomStringConvertible {
     var policy = QUICBackpressurePolicy(maxFrames: nil, maxAgeNanos: nil)
     for part in value.split(separator: ",") {
       let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-      guard pair.count == 2, let number = Double(pair[1]) else {
+      // Only finite, non-negative values are accepted: converting anything else to an integer traps.
+      guard pair.count == 2, let number = Double(pair[1]), number.isFinite, number >= 0, number < 1e12 else {
         continue
       }
       switch pair[0] {
@@ -210,7 +211,8 @@ struct QUICAdaptiveBitRate: Equatable {
     var config = QUICAdaptiveBitRate()
     for part in value.split(separator: ",") {
       let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-      guard pair.count == 2, let number = Double(pair[1]) else {
+      // Only finite, non-negative values are accepted: converting anything else to an integer traps.
+      guard pair.count == 2, let number = Double(pair[1]), number.isFinite, number >= 0, number < 1e12 else {
         continue
       }
       switch pair[0] {
@@ -221,7 +223,7 @@ struct QUICAdaptiveBitRate: Equatable {
       case "low": config.lowQueueNanos = UInt64(number * 1_000_000)
       case "down": config.decrease = number
       case "up": config.increase = number
-      case "interval": config.intervalMilliseconds = Int(number)
+      case "interval": config.intervalMilliseconds = max(50, Int(number))
       default: continue
       }
     }
@@ -285,7 +287,7 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
   private let onBitRateChange: @Sendable (Int) -> Void
   /// `IDB_QUIC_KEYFRAME_MIN_INTERVAL_MS=N` ignores a client's keyframe request while a keyframe is
   /// still unacknowledged or one was sent less than N ms ago (0, the default, honours every request).
-  private let keyFrameMinIntervalNanos = UInt64(ProcessInfo.processInfo.environment["IDB_QUIC_KEYFRAME_MIN_INTERVAL_MS"].flatMap(Double.init) ?? 0) * 1_000_000
+  private let keyFrameMinIntervalNanos = UInt64(ProcessInfo.processInfo.environment["IDB_QUIC_KEYFRAME_MIN_INTERVAL_MS"].flatMap(Double.init).flatMap { $0.isFinite && $0 >= 0 && $0 < 1e9 ? $0 : nil } ?? 0) * 1_000_000
   /// `IDB_QUIC_CANCEL_ON_KEYFRAME=0` keeps in-flight frames when a keyframe is sent.
   private let cancelOnKeyFrame = ProcessInfo.processInfo.environment["IDB_QUIC_CANCEL_ON_KEYFRAME"] != "0"
   private let trace = VideoFrameTrace.shared
@@ -462,6 +464,13 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
       port = listener.port?.rawValue ?? 0
       listenerReady?.resume()
       listenerReady = nil
+      // Without a client the video stream would keep encoding into nothing until stopped.
+      queue.asyncAfter(deadline: .now() + .seconds(Self.clientWaitSeconds)) { [weak self] in
+        guard let self, self.client == nil else {
+          return
+        }
+        self.end("no client presented the session token within \(Self.clientWaitSeconds) s")
+      }
     case let .failed(error):
       listenerReady?.resume(throwing: QUICVideoSessionError.listenerFailed("\(error)"))
       listenerReady = nil
@@ -505,8 +514,13 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
 
   // MARK: Accepting the client
 
+  /// How long the session waits for a client to present its token before ending.
+  static let clientWaitSeconds = 30
+  /// Connection groups that have not presented the token yet, at most.
+  static let maxConnecting = 8
+
   private func accept(_ group: NWConnectionGroup) {
-    guard !ended, client == nil else {
+    guard !ended, client == nil, connecting.count < Self.maxConnecting else {
       group.cancel()
       return
     }

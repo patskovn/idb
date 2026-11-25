@@ -133,6 +133,7 @@ struct VideoStreamMethodHandler {
       videoStream = try await target.videoStream.create(configuration: configuration, to: session)
     } catch {
       session.close()
+      keyFrameRelay.detach()
       throw error
     }
     keyFrameRelay.attach(videoStream)
@@ -150,6 +151,9 @@ struct VideoStreamMethodHandler {
       task.cancel()
     }
     session.close()
+    // The session's callbacks hold the relay, the relay holds the stream, and the stream's encoder
+    // holds the session as its consumer: detaching breaks that cycle so all of it is freed.
+    defer { keyFrameRelay.detach() }
     try await videoStream.stopStreaming()
     targetLogger.log("The QUIC video stream is terminated")
     try await winner.value
@@ -161,14 +165,26 @@ struct VideoStreamMethodHandler {
 private final class StreamControlRelay: Sendable {
   private struct State: Sendable {
     var videoStream: (any VideoStreamOperation)?
+    var detached = false
     var requestedBeforeAttach = false
     var bitRateBeforeAttach: Int?
   }
 
   private let state = OSAllocatedUnfairLock(initialState: State())
 
+  /// Drops the stream once the session is over; later requests do nothing.
+  func detach() {
+    state.withLock { state in
+      state.videoStream = nil
+      state.detached = true
+    }
+  }
+
   func attach(_ stream: any VideoStreamOperation) {
     let (requested, bitRate) = state.withLock { state -> (Bool, Int?) in
+      guard !state.detached else {
+        return (false, nil)
+      }
       state.videoStream = stream
       defer {
         state.requestedBeforeAttach = false

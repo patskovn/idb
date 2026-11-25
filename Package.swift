@@ -57,8 +57,9 @@ let package = Package(
       name: "CompanionDiscovery",
       path: "CompanionDiscovery"
     ),
-    // The gRPC/protobuf types generated from proto/idb.proto (checked in under
-    // IDBGRPCSwift/). Run `./build.sh generate-proto` to regenerate them.
+    // The gRPC/protobuf types generated from proto/idb.proto into IDBGRPCSwift/. They are not
+    // checked in: on a fresh clone run `brew install protobuf && ./build.sh generate-proto`
+    // before building any product that uses them (idb-repl, idb-video).
     .target(
       name: "IDBGRPCSwift",
       dependencies: [
@@ -101,7 +102,8 @@ let package = Package(
       ]
     ),
     // Streams a simulator's screen from idb_companion over QUIC
-    // (`swift build --product idb-video`). Pure Swift on IDBGRPCSwift and the
+    // (`./build.sh generate-proto`, then `swift build -c release --product idb-video`).
+    // Pure Swift on IDBGRPCSwift and the
     // system Network framework.
     .executableTarget(
       name: "idb-video",

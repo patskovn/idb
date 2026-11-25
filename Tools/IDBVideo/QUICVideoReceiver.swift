@@ -190,6 +190,10 @@ final class QUICVideoReceiver: @unchecked Sendable {
     }
     connectedAt = DispatchTime.now().uptimeNanoseconds
     group.start(queue: queue)
+    queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+      guard let self, !self.ended, self.control == nil else { return }
+      self.end("could not connect over QUIC (UDP) to \(self.host):\(self.port) within 10 s; check that UDP reaches the companion, or use --transport grpc")
+    }
   }
 
   private func openControlStream(on group: NWConnectionGroup) {
@@ -253,26 +257,31 @@ final class QUICVideoReceiver: @unchecked Sendable {
 
   private func receiveFrame(on stream: NWConnection) {
     stream.start(queue: queue)
-    read(stream, accumulated: Data())
+    read(stream, buffer: ReceiveBuffer())
   }
 
-  private func read(_ stream: NWConnection, accumulated: Data) {
+  /// The bytes received on a stream so far. A reference, so appending a chunk does not copy what
+  /// arrived before it.
+  private final class ReceiveBuffer: @unchecked Sendable {  // used only on the receiver queue
+    var data = Data()
+  }
+
+  private func read(_ stream: NWConnection, buffer: ReceiveBuffer) {
     stream.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] content, _, isComplete, error in
       guard let self, !self.ended else {
         stream.cancel()
         return
       }
-      var accumulated = accumulated
       if let content {
-        accumulated.append(content)
+        buffer.data.append(content)
       }
       // Single-stream framing: frames follow one another on this stream until the session ends.
-      if accumulated.first == QUICVideoWire.streamVersion {
-        self.consumeStreamFrames(&accumulated)
+      if buffer.data.first == QUICVideoWire.streamVersion {
+        self.consumeStreamFrames(&buffer.data)
         if error != nil || isComplete {
           stream.cancel()
         } else {
-          self.read(stream, accumulated: accumulated)
+          self.read(stream, buffer: buffer)
         }
         return
       }
@@ -282,11 +291,11 @@ final class QUICVideoReceiver: @unchecked Sendable {
         return
       }
       guard isComplete else {
-        self.read(stream, accumulated: accumulated)
+        self.read(stream, buffer: buffer)
         return
       }
       stream.cancel()
-      self.parse(accumulated)
+      self.parse(buffer.data)
     }
   }
 
@@ -356,11 +365,15 @@ final class QUICVideoReceiver: @unchecked Sendable {
     }
     pending[frame.sequence] = frame
     if waitingForKeyFrame {
-      guard let keyFrame = latestPendingKeyFrame() else {
+      if pending[nextSequence] != nil {
+        // The missing frame arrived after all: carry on from it.
+        waitingForKeyFrame = false
+      } else if let keyFrame = latestPendingKeyFrame() {
+        resume(at: keyFrame)
+      } else {
         trimPending()
         return
       }
-      resume(at: keyFrame)
     }
     drain()
     guard !pending.isEmpty else {
@@ -410,7 +423,13 @@ final class QUICVideoReceiver: @unchecked Sendable {
     queue.asyncAfter(deadline: .now() + gapTimeout) { [weak self] in
       guard let self, !self.ended else { return }
       self.gapCheckScheduled = false
-      guard !self.waitingForKeyFrame, self.nextSequence == gapStart, !self.pending.isEmpty else {
+      if self.waitingForKeyFrame {
+        // Ask again until a keyframe arrives: the first request or its keyframe can be lost.
+        self.requestKeyFrame()
+        self.scheduleGapCheck()
+        return
+      }
+      guard self.nextSequence == gapStart, !self.pending.isEmpty else {
         if !self.pending.isEmpty {
           self.scheduleGapCheck()
         }
@@ -425,7 +444,7 @@ final class QUICVideoReceiver: @unchecked Sendable {
 
   private func requestKeyFrame() {
     let now = DispatchTime.now().uptimeNanoseconds
-    guard now - lastKeyFrameRequest > 250_000_000 else {
+    guard now - lastKeyFrameRequest > 500_000_000 else {
       return
     }
     lastKeyFrameRequest = now

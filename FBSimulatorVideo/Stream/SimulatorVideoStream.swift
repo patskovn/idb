@@ -210,6 +210,10 @@ public actor SimulatorVideoStream: VideoStreamOperation {
   /// In `.lazy` mode a frame dropped for backpressure is pushed again once there is room, so the last
   /// state of the screen always reaches the consumer even if the screen then stays still.
   private var retryAfterDropTask: Task<Void, Never>?
+  /// Retries since the consumer last took a frame; each one waits twice as long, up to 0.5 s.
+  private var retriesSinceLastPush = 0
+  /// Frames dropped since the consumer became full, logged once when it catches up.
+  private var droppedSinceFull: Int?
 
   var pixelBuffer: CVPixelBuffer?
   /// The mounted surface as the interface shows it.
@@ -702,7 +706,15 @@ public actor SimulatorVideoStream: VideoStreamOperation {
       return
     }
     let forceKeyFrame = requestedKeyFrame || keyFrameOwed
-    if !consumer.hasCapacityForFrame(logger: logger) {
+    let capacity = consumer.frameCapacity()
+    if !capacity.hasCapacity {
+      // Logged when the consumer becomes full, not on every dropped frame or retry.
+      if let dropped = droppedSinceFull {
+        droppedSinceFull = dropped + 1
+      } else {
+        droppedSinceFull = 1
+        logger.log("Consumer is overflown. Number of unsent frames: \(capacity.queued)")
+      }
       // `IDB_VIDEO_LEGACY_BACKPRESSURE=1` restores the old behaviour (a dropped keyframe request is
       // lost, a dropped frame is not pushed again) for before/after measurements.
       if !Self.legacyBackpressure {
@@ -711,7 +723,15 @@ public actor SimulatorVideoStream: VideoStreamOperation {
       }
       return
     }
+    if let dropped = droppedSinceFull {
+      logger.log("Consumer caught up after \(dropped) dropped frames")
+      droppedSinceFull = nil
+    }
     keyFrameOwed = false
+    // This frame carries the latest screen, so a retry scheduled for an earlier drop is not needed.
+    retryAfterDropTask?.cancel()
+    retryAfterDropTask = nil
+    retriesSinceLastPush = 0
 
     // Uptime is monotonic; the wall clock steps under NTP and can hand the encoder (and a file
     // writer) a timestamp earlier than the previous frame's.
@@ -755,16 +775,20 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     self.frameNumber = frameNumber + 1
   }
 
-  private static var legacyBackpressure: Bool {
-    ProcessInfo.processInfo.environment["IDB_VIDEO_LEGACY_BACKPRESSURE"] == "1"
-  }
+  private static let legacyBackpressure = ProcessInfo.processInfo.environment["IDB_VIDEO_LEGACY_BACKPRESSURE"] == "1"
 
   private func scheduleRetryAfterDrop() {
     guard case .lazy = cadence, retryAfterDropTask == nil else {
       return
     }
+    // 33 ms, then twice as long per retry while the consumer stays full, up to 0.5 s.
+    let delay = min(33 << min(retriesSinceLastPush, 4), 500)
+    retriesSinceLastPush += 1
     retryAfterDropTask = Task { [weak self] in
-      try? await Task.sleep(for: .milliseconds(33))
+      try? await Task.sleep(for: .milliseconds(delay))
+      guard !Task.isCancelled else {
+        return
+      }
       await self?.retryDroppedFrame()
     }
   }

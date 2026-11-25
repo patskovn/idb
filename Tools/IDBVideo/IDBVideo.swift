@@ -10,6 +10,7 @@ import Foundation
 import GRPCCore
 import GRPCNIOTransportHTTP2Posix
 import IDBGRPCSwift
+import os
 
 /// Streams a target's screen from an idb companion over QUIC and writes the Annex-B video to a
 /// file or stdout, for example into `ffplay -f hevc -`.
@@ -85,7 +86,7 @@ struct IDBVideo: AsyncParsableCommand {
   mutating func run() async throws {
     signal(SIGPIPE, SIG_IGN)
     let (target, defaultQUICHost) = try parseCompanion()
-    guard let quicHost = quicHost ?? defaultQUICHost else {
+    guard let quicHost = quicHost ?? defaultQUICHost ?? (transport == .grpc ? "" : nil) else {
       throw ValidationError("--quic-host is required with a unix socket companion")
     }
     let output = try openOutput()
@@ -110,12 +111,27 @@ struct IDBVideo: AsyncParsableCommand {
 
     let (controlMessages, control) = AsyncStream<Idb_VideoStreamRequest>.makeStream()
     control.yield(start)
+    let stopping = OSAllocatedUnfairLock(initialState: false)
     let stop: @Sendable (String) -> Void = { reason in
+      guard !stopping.withLock({ defer { $0 = true }; return $0 }) else {
+        return
+      }
       log("stopping: \(reason)")
       control.yield(.with { $0.stop = .init() })
       control.finish()
+      // The companion normally ends the call at once; after a network drop it never answers.
+      DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+        log("the companion did not end the stream within 5 s; exiting")
+        Darwin.exit(1)
+      }
     }
-    let signals = installSignalHandlers { stop("interrupted") }
+    let signals = installSignalHandlers {
+      // A second Ctrl-C exits without waiting for the companion.
+      if stopping.withLock({ $0 }) {
+        Darwin.exit(130)
+      }
+      stop("interrupted")
+    }
     defer { signals.forEach { $0.cancel() } }
     if let duration {
       Task {
@@ -125,7 +141,11 @@ struct IDBVideo: AsyncParsableCommand {
     }
 
     let statsInterval = statsInterval
-    let transport = try HTTP2ClientTransport.Posix(target: target, transportSecurity: .plaintext)
+    let requestedTransport = transport
+    // Keepalive pings while the call runs notice a dead connection in seconds instead of minutes.
+    let transport = try HTTP2ClientTransport.Posix(
+      target: target, transportSecurity: .plaintext,
+      config: .defaults { $0.connection.keepalive = .init(time: .seconds(10), timeout: .seconds(5), allowWithoutCalls: false) })
     try await withGRPCClient(transport: transport) { client in
       let service = Idb_CompanionService.Client(wrapping: client)
       try await service.video_stream(
@@ -164,6 +184,12 @@ struct IDBVideo: AsyncParsableCommand {
             FileHandle.standardError.write(data)
           case let .payload(payload):
             // The gRPC transport: each payload is one Annex-B access unit.
+            guard requestedTransport == .grpc else {
+              // A companion without QUIC support ignores the transport and the HEVC format and
+              // streams H.264 over gRPC, which would play as nothing.
+              throw ValidationError(
+                "The companion streamed over gRPC instead of QUIC, so it does not support QUIC. Rebuild and restart idb_companion from the quic-video branch, or use --transport grpc --codec h264.")
+            }
             guard case let .data(frame) = payload.source else {
               continue
             }
