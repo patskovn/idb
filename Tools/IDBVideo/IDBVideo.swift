@@ -142,10 +142,10 @@ struct IDBVideo: AsyncParsableCommand {
 
     let statsInterval = statsInterval
     let requestedTransport = transport
-    // Keepalive pings while the call runs notice a dead connection in seconds instead of minutes.
-    let transport = try HTTP2ClientTransport.Posix(
-      target: target, transportSecurity: .plaintext,
-      config: .defaults { $0.connection.keepalive = .init(time: .seconds(10), timeout: .seconds(5), allowWithoutCalls: false) })
+    // No gRPC keepalive: the companion's server allows one ping per 5 minutes and closes the
+    // connection after a few more while no data flows (a still screen). A dead network is noticed
+    // by the QUIC idle timeout instead, which ends the receiver and so stops the call.
+    let transport = try HTTP2ClientTransport.Posix(target: target, transportSecurity: .plaintext)
     try await withGRPCClient(transport: transport) { client in
       let service = Idb_CompanionService.Client(wrapping: client)
       try await service.video_stream(
