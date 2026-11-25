@@ -77,7 +77,7 @@ final class QUICVideoReceiver: @unchecked Sendable {
   private let alpn: String
   private let certificateSHA256: Data
   private let token: Data
-  private let output: FileHandle
+  private let output: any FrameOutput
   private let frameLog: FrameLog?
   /// Written after every frame so parser-based viewers (ffplay, ffmpeg, mpv) can end the access unit
   /// at once instead of waiting for the next frame's start; nil to write frames bare.
@@ -104,7 +104,7 @@ final class QUICVideoReceiver: @unchecked Sendable {
   private var firstFrameLogged = false
 
   init(
-    host: String, port: UInt16, alpn: String, certificateSHA256: Data, token: Data, output: FileHandle, frameLog: FrameLog?,
+    host: String, port: UInt16, alpn: String, certificateSHA256: Data, token: Data, output: any FrameOutput, frameLog: FrameLog?,
     statsInterval: Double,
     maxUDPPayloadSize: Int = 0,
     gapTimeoutMilliseconds: Int = 100,
@@ -455,9 +455,9 @@ final class QUICVideoReceiver: @unchecked Sendable {
   private func write(_ frame: Frame) {
     do {
       if let accessUnitDelimiter {
-        try output.write(contentsOf: frame.payload + accessUnitDelimiter)
+        try output.writeFrame(frame.payload + accessUnitDelimiter)
       } else {
-        try output.write(contentsOf: frame.payload)
+        try output.writeFrame(frame.payload)
       }
       frameLog?.record(
         bytes: frame.payload.count, isKeyFrame: frame.isKeyFrame, sequence: frame.sequence, capturedAt: frame.capturedAt,

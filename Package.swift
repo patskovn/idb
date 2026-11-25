@@ -112,8 +112,14 @@ let package = Package(
         .product(name: "GRPCCore", package: "grpc-swift-2"),
         .product(name: "GRPCNIOTransportHTTP2Posix", package: "grpc-swift-nio-transport"),
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        "IDBVideoShm",
       ],
       path: "Tools/IDBVideo"
+    ),
+    // shm_open for idb-video's --kitty output (variadic, so not callable from Swift).
+    .target(
+      name: "IDBVideoShm",
+      path: "Tools/IDBVideoShm"
     ),
     .plugin(
       name: "GenerateBuildInfo",

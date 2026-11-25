@@ -53,6 +53,9 @@ struct IDBVideo: AsyncParsableCommand {
   @Flag(help: "Write frames without an access unit delimiter after each one. By default one is appended so ffplay, ffmpeg and mpv show each frame as soon as it arrives instead of when the next one starts.")
   var noAud = false
 
+  @Flag(help: "Decode the video and draw it in this terminal with the kitty graphics protocol (shared memory), instead of writing the stream. Needs a terminal on this machine that supports it, such as kitty, Ghostty or Rex.")
+  var kitty = false
+
   @Option(help: "hevc or h264.")
   var codec: Codec = .hevc
 
@@ -90,6 +93,9 @@ struct IDBVideo: AsyncParsableCommand {
       throw ValidationError("--quic-host is required with a unix socket companion")
     }
     let output = try openOutput()
+    let kittyOutput = output as? KittyTerminalOutput
+    kittyOutput?.start()
+    defer { kittyOutput?.finish() }
     let frameLog = try frameLog.map(FrameLog.init(path:))
     let quicConnectOverride = try quicConnect.map(parseHostPort)
     let maxUDPPayload = quicMaxUDPPayload
@@ -140,7 +146,8 @@ struct IDBVideo: AsyncParsableCommand {
       }
     }
 
-    let statsInterval = statsInterval
+    // With --kitty the picture fills the terminal that stderr usually also writes to.
+    let statsInterval = kitty && isatty(STDERR_FILENO) == 1 ? 0 : statsInterval
     let requestedTransport = transport
     // No gRPC keepalive: the companion's server allows one ping per 5 minutes and closes the
     // connection after a few more while no data flows (a still screen). A dead network is noticed
@@ -195,7 +202,7 @@ struct IDBVideo: AsyncParsableCommand {
             }
             let isKeyFrame = AnnexBKeyFrameDetector.isKeyFrame(frame, codec: codec)
             do {
-              try output.write(contentsOf: accessUnitDelimiter.map { frame + $0 } ?? frame)
+              try output.writeFrame(accessUnitDelimiter.map { frame + $0 } ?? frame)
             } catch {
               stop("cannot write the video: \(error)")
               continue
@@ -237,9 +244,18 @@ struct IDBVideo: AsyncParsableCommand {
     return (host, port)
   }
 
-  private func openOutput() throws -> FileHandle {
+  private func openOutput() throws -> any FrameOutput {
+    if kitty {
+      guard output == "-" else {
+        throw ValidationError("--kitty draws in the terminal, so it cannot be combined with --output")
+      }
+      guard isatty(STDOUT_FILENO) == 1 else {
+        throw ValidationError("--kitty needs stdout to be a terminal")
+      }
+      return KittyTerminalOutput(isHEVC: codec == .hevc)
+    }
     if output == "-" {
-      return .standardOutput
+      return FileHandle.standardOutput
     }
     guard FileManager.default.createFile(atPath: output, contents: nil) else {
       throw ValidationError("Cannot create \(output)")
