@@ -437,7 +437,7 @@ struct CompanionTelemetryTests {
     "list_apps", "terminate", "uninstall", "add_media", "inject_audio", "inject_video", "record",
     "screenshot", "video_stream", "crash_delete", "crash_list", "crash_show", "xctest_list_bundles",
     "xctest_list_tests", "xctest_run", "repl", "ls", "mkdir", "mv", "rm", "pull", "push", "tail",
-    "get_orientation", "set_orientation", "hinge_angle",
+    "get_orientation", "set_orientation", "hinge_angle", "device_chrome",
   ]
 
   @Test

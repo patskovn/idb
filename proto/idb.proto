@@ -19,6 +19,8 @@ service CompanionService {
   rpc forward_port(stream ForwardPortRequest)
       returns (stream ForwardPortResponse) {}
   rpc describe(TargetDescriptionRequest) returns (TargetDescriptionResponse) {}
+  // The hardware buttons on a simulator's body and where they are.
+  rpc device_chrome(DeviceChromeRequest) returns (DeviceChromeResponse) {}
   rpc install(stream InstallRequest) returns (stream InstallResponse) {}
   rpc log(LogRequest) returns (stream LogResponse) {}
   rpc xctrace_record(stream XctraceRecordRequest)
@@ -118,6 +120,50 @@ message ForwardPortResponse {
     Opened opened = 1;
     bytes data = 2;
   }
+}
+
+message DeviceChromeRequest {}
+
+// The body Simulator draws around a simulated device's screen: its hardware
+// buttons, each placed against the screen. From the description Xcode installs
+// for the device type's body shape.
+message DeviceChromeResponse {
+  enum Edge {
+    LEFT = 0;
+    RIGHT = 1;
+    TOP = 2;
+    BOTTOM = 3;
+  }
+  message Button {
+    // The description's name for it: "volume-up", "volume-down", "power",
+    // "action", "mute", "home", "side-button", "digital-crown", ...
+    string name = 1;
+    // What Simulator calls it, such as "Volume Up".
+    string title = 2;
+    // "button", "switch" or "crown".
+    string kind = 3;
+    // The edge of the body it is on.
+    Edge edge = 4;
+    // Where it starts along that edge and how long it is, in points of the
+    // screen: from the screen's top for LEFT and RIGHT, from its left for TOP
+    // and BOTTOM. A button beside the bezel rather than the screen starts
+    // before zero or ends past the screen's size.
+    double start = 5;
+    double length = 6;
+    // The HID usage Simulator sends for it.
+    uint32 usage_page = 7;
+    uint32 usage = 8;
+  }
+  // The description's identifier, such as
+  // "com.apple.dt.devicekit.chrome.phone11".
+  string identifier = 1;
+  // The screen the buttons are placed against, in points, upright.
+  double screen_width_points = 2;
+  double screen_height_points = 3;
+  repeated Button buttons = 4;
+  // The radius of the screen's corners in points; zero for square ones. The
+  // frames of a video stream are the whole rectangle either way.
+  double screen_corner_radius = 5;
 }
 
 message GetOrientationRequest {}

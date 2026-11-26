@@ -142,6 +142,12 @@ final class CompanionServiceProvider: Idb_CompanionService.SimpleServiceProtocol
     }
   }
 
+  func device_chrome(request: Idb_DeviceChromeRequest, context: ServerContext) async throws -> Idb_DeviceChromeResponse {
+    try await trackedUnaryCall(context, request: request) {
+      try DeviceChromeMethodHandler(target: self.target).handle()
+    }
+  }
+
   func forward_port(request: RPCAsyncSequence<Idb_ForwardPortRequest, any Error>, response: RPCWriter<Idb_ForwardPortResponse>, context: ServerContext) async throws {
     let reader = RequestStreamReader(request)
     try await trackedBidiStreaming(context) {
