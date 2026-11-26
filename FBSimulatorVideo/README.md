@@ -37,6 +37,25 @@ A recording runs, counts and holds its file until `stop()` returns on the handle
 
 A consumer that drives the pipeline itself, for example to composite its own overlays, connects a framebuffer and builds the stream directly with `SimulatorVideoStream.start(framebuffer:configuration:to:logger:)`.
 
+## Live audio
+
+`SimulatorAudioStream` gives what a Simulator plays, as it plays it: its apps, SpringBoard and its system sounds, and nothing else that plays on the Mac. The companion sends it beside a QUIC video stream, so the sound is heard where the picture is watched.
+
+```swift
+let audio = SimulatorAudioStream(simulator: simulator, logger: logger) { packet in
+  // packet.data is one Opus packet: 10 ms, 48 kHz, stereo.
+}
+try audio.start()
+// ...
+audio.stop()
+```
+
+- **Where it is read.** A Simulator's processes play into the Mac's audio system themselves, each as a client of its own. The stream finds those descended from the Simulator's `launchd_sim` and reads them with a Core Audio process tap, mixed down to stereo. It follows them as apps start and exit, and moves with the Mac's default output device, whose clock the tap is read against.
+- **Muted on the Mac.** While the stream runs the Mac does not play the Simulator's sound itself, unless `mutesHost` is false. Stopping the stream gives it back.
+- **Silence is not sent.** A tap delivers silence as zeros at the full rate, and a Simulator is silent most of the time. A run of packets starts with the first sound and ends after half a second without any; the first packet of a run says so (`startsRun`), for a player to start its buffering again.
+- **Timestamps.** Each packet carries the Mac's uptime at which its first frame played, the clock a streamed frame's capture time is on.
+- **Permission.** macOS lets a process record system audio only if the app responsible for it is allowed to, under System Settings > Privacy & Security > Screen & System Audio Recording > System Audio Recording Only. For a companion started from a terminal that app is the terminal; one started over SSH has no app that can be allowed. `start` checks first (`SystemAudioCapturePermission`) and throws without making a tap when the permission is not granted. It never asks: Core Audio answers a tap from a process whose permission is undecided by asking the user, and holds the call until the question is answered. With the screen locked nobody can answer, and a question left open that way has been seen to leave the Mac's audio service answering no client at all, so that nothing on the Mac played, until it timed out minutes later.
+
 ## The recorder session
 
 `Recorder/` holds the session setup and the line-oriented stdin protocol that the `sim-video` tool uses, so other local clients can drive a recording the same way. The protocol is documented in [the `sim-video` README](../Tools/VideoRecorder/README.md).

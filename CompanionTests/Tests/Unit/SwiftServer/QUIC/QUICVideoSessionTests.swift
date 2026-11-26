@@ -116,6 +116,31 @@ struct QUICStreamFramingTests {
 }
 
 @Suite
+struct QUICAudioFramingTests {
+
+  @Test
+  func anAudioPacketHeaderCarriesItsLengthSequenceAndWhenItPlayed() {
+    let header = QUICVideoWire.audioPacketHeader(length: 0x0141, sequence: 7, startsRun: true, playedAtUptimeNanos: 0x0a0b)
+    #expect(header.count == QUICVideoWire.audioPacketHeaderLength)
+    #expect(Array(header.prefix(8)) == [3, 1, 0, 0, 0, 0, 0x01, 0x41])
+    #expect(QUICVideoWire.uint64(bigEndian: Array(header)[8..<16]) == 7)
+    #expect(QUICVideoWire.uint64(bigEndian: Array(header)[16..<24]) == 0x0a0b)
+  }
+
+  @Test
+  func aPacketThatContinuesARunHasNoFlag() {
+    #expect(QUICVideoWire.audioPacketHeader(length: 1, sequence: 1, startsRun: false, playedAtUptimeNanos: 0)[1] == 0)
+  }
+
+  @Test
+  func theFirstByteTellsAnAudioStreamFromAFrame() {
+    let audio = QUICVideoWire.audioPacketHeader(length: 1, sequence: 0, startsRun: true, playedAtUptimeNanos: 0)
+    #expect(audio[0] != QUICVideoWire.frameHeader(sequence: 0, isKeyFrame: true, capturedAtUptimeNanos: 0)[0])
+    #expect(audio[0] != QUICVideoWire.streamFrameHeader(length: 1, sequence: 0, isKeyFrame: true, capturedAtUptimeNanos: 0)[0])
+  }
+}
+
+@Suite
 struct QUICBackpressurePolicyTests {
 
   @Test

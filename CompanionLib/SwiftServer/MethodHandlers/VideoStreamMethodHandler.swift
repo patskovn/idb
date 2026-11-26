@@ -7,6 +7,7 @@
 
 import FBControlCore
 import FBSimulatorControl
+import FBSimulatorVideo
 import FBVideoCore
 import GRPCCore
 import IDBConcurrency
@@ -120,6 +121,11 @@ struct VideoStreamMethodHandler {
       throw RPCError(code: .unavailable, message: "Failed to start the QUIC video session: \(error)")
     }
 
+    // Started before the answer, which says whether there will be sound. It takes a few
+    // milliseconds: nothing is asked of the user, see `SystemAudioCapturePermission`.
+    let audio = start.audio ? startAudio(to: session) : nil
+    defer { audio?.stream?.stop() }
+
     let videoStream: any VideoStreamOperation
     do {
       try await responseStream.write(
@@ -129,6 +135,9 @@ struct VideoStreamMethodHandler {
             $0.certificateSha256 = session.certificateSHA256
             $0.token = session.token
             $0.alpn = QUICVideoWire.alpn
+            if let audio {
+              $0.audio = audio.description
+            }
           }
         })
       targetLogger.log("QUIC video session listening on UDP port \(session.port) for \(configuration)")
@@ -159,6 +168,31 @@ struct VideoStreamMethodHandler {
     try await videoStream.stopStreaming()
     targetLogger.log("The QUIC video stream is terminated")
     try await winner.value
+  }
+}
+
+extension VideoStreamMethodHandler {
+
+  /// Starts sending what the target plays to `session`. When it cannot, the stream is nil and the
+  /// description says why.
+  fileprivate func startAudio(to session: QUICVideoSession) -> (stream: SimulatorAudioStream?, description: Idb_VideoStreamResponse.Audio) {
+    do {
+      let stream = SimulatorAudioStream(simulator: try target.simulator(), logger: targetLogger) { [weak session] packet in
+        session?.sendAudio(packet.data, playedAtUptimeNanos: packet.playedAtUptimeNanos, startsRun: packet.startsRun)
+      }
+      try stream.start()
+      return (
+        stream,
+        .with {
+          $0.sampleRate = UInt32(SimulatorAudioStream.sampleRate)
+          $0.channels = UInt32(SimulatorAudioStream.channels)
+          $0.framesPerPacket = UInt32(SimulatorAudioStream.framesPerPacket)
+        }
+      )
+    } catch {
+      targetLogger.log("QUIC video: no audio in this session: \(error.localizedDescription)")
+      return (nil, .with { $0.unavailableReason = error.localizedDescription })
+    }
   }
 }
 

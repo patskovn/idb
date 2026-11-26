@@ -1211,6 +1211,11 @@ message VideoStreamRequest {
     uint32 quic_port = 9;
     // HEVC only: how much colour detail the video keeps. H.264 is always 4:2:0.
     Chroma chroma = 10;
+    // QUIC only: also send what the target plays, as Opus, on a stream of its
+    // own in the session. While it is sent the companion's Mac does not play it
+    // itself. The `quic_session` response says whether it will be sent. A
+    // companion older than this field ignores it and its response has no `audio`.
+    bool audio = 11;
   }
   enum Chroma {
     // 4:2:0, 8 bits: colour at half the resolution in each direction. Every
@@ -1243,6 +1248,18 @@ message VideoStreamResponse {
     bytes certificate_sha256 = 2;
     bytes token = 3;
     string alpn = 4;
+    // Set when the request asked for audio.
+    Audio audio = 5;
+  }
+  // The target's sound in a QUIC session: Opus packets on a stream of their own.
+  message Audio {
+    // Empty when the sound is sent. Otherwise why it is not, for the person
+    // watching: the stream then carries video alone.
+    string unavailable_reason = 1;
+    uint32 sample_rate = 2;
+    uint32 channels = 3;
+    // The frames in every packet.
+    uint32 frames_per_packet = 4;
   }
   oneof output {
     bytes log_output = 1;

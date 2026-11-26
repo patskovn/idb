@@ -24,6 +24,13 @@ import os
 ///   big-endian. A client on the same host can subtract it from its own uptime to get the latency.
 /// - The client writes control messages on the control stream: `ack` + sequence when it has
 ///   received a frame, `keyFrame` to ask for one, `ping` to keep an idle session open.
+/// - A session asked for audio also carries what the target plays, on one more unidirectional stream
+///   the companion opens with the first packet and keeps open. Each Opus packet is preceded by a
+///   24-byte header: version 3 (UInt8), flags (UInt8, bit 0 = the packet starts a run: it does not
+///   continue the one before it, because silence in between was not sent or packets were dropped),
+///   reserved (UInt16), payload length (UInt32), sequence (UInt64), and the uptime in nanoseconds at
+///   which the packet's first frame played, on the clock of a frame's capture time. The response
+///   that names the session gives the sample rate, channels and frames per packet.
 enum QUICVideoWire {
   static let alpn = "idb-video/1"
   static let version: UInt8 = 1
@@ -69,6 +76,21 @@ enum QUICVideoWire {
     header.append(contentsOf: bigEndianBytes(UInt64(length)).suffix(4))
     header.append(contentsOf: bigEndianBytes(sequence))
     header.append(contentsOf: bigEndianBytes(capturedAtUptimeNanos))
+    return header
+  }
+
+  static let audioVersion: UInt8 = 3
+  static let audioPacketHeaderLength = 24
+  static let audioStartsRunFlag: UInt8 = 1 << 0
+
+  static func audioPacketHeader(length: Int, sequence: UInt64, startsRun: Bool, playedAtUptimeNanos: UInt64) -> Data {
+    var header = Data(capacity: audioPacketHeaderLength)
+    header.append(audioVersion)
+    header.append(startsRun ? audioStartsRunFlag : 0)
+    header.append(contentsOf: [0, 0])
+    header.append(contentsOf: bigEndianBytes(UInt64(length)).suffix(4))
+    header.append(contentsOf: bigEndianBytes(sequence))
+    header.append(contentsOf: bigEndianBytes(playedAtUptimeNanos))
     return header
   }
 
@@ -307,6 +329,13 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
   /// `IDB_QUIC_FRAMING=stream` sends every frame on one long-lived stream instead of one stream per frame.
   private let streamFraming = ProcessInfo.processInfo.environment["IDB_QUIC_FRAMING"] == "stream"
   private var nextSequence: UInt64 = 0
+  /// The long-lived stream that carries the audio, opened with the first packet.
+  private var audioStream: NWConnection?
+  private var nextAudioSequence: UInt64 = 0
+  /// Audio packets handed to the stream and not yet taken by QUIC.
+  private var audioUnsent = 0
+  /// Set when a packet was dropped, so that the next one sent says it starts a run.
+  private var audioBroken = false
   private var lastKeyFrameSentAt: UInt64 = 0
   private var keyFrameInFlight: UInt64?
   private var ignoredKeyFrameRequests = 0
@@ -329,6 +358,9 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     var cancelled = 0
     var roundTripNanos: UInt64 = 0
     var roundTripMaxNanos: UInt64 = 0
+    var audioPackets = 0
+    var audioBytes = 0
+    var audioDropped = 0
   }
 
   /// Listens on `port` (0 for any) and returns once the listener is ready.
@@ -406,6 +438,13 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
 
   func consumeEndOfFile() {
     queue.async { self.end("the video stream ended") }
+  }
+
+  /// Sends one packet of the target's audio. Packets handed over before the client has connected
+  /// are dropped, as are packets the network is not taking: sound that arrives late is worse than
+  /// a gap.
+  func sendAudio(_ packet: Data, playedAtUptimeNanos: UInt64, startsRun: Bool) {
+    queue.async { self.send(audio: packet, playedAtUptimeNanos: playedAtUptimeNanos, startsRun: startsRun) }
   }
 
   var consumption: DataConsumption {
@@ -498,6 +537,8 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     inFlight.removeAll()
     frameStream?.forceCancel()
     frameStream = nil
+    audioStream?.forceCancel()
+    audioStream = nil
     outstanding.withLock { $0 = Outstanding() }
     controlStream?.cancel()
     client?.cancel()
@@ -732,6 +773,54 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     }
   }
 
+  // MARK: Sending audio
+
+  /// Packets QUIC has not taken yet, at most: half a second of sound.
+  static let maxAudioUnsent = 50
+
+  private func send(audio packet: Data, playedAtUptimeNanos: UInt64, startsRun: Bool) {
+    guard !ended, let client else {
+      audioBroken = true
+      return
+    }
+    guard audioUnsent < Self.maxAudioUnsent else {
+      audioBroken = true
+      window.audioDropped += 1
+      return
+    }
+    let stream: NWConnection
+    if let audioStream {
+      stream = audioStream
+    } else {
+      guard let newStream = NWConnection(from: client, using: frameStreamOptions) else {
+        audioBroken = true
+        return
+      }
+      newStream.start(queue: queue)
+      audioStream = newStream
+      stream = newStream
+    }
+    var message = QUICVideoWire.audioPacketHeader(
+      length: packet.count, sequence: nextAudioSequence, startsRun: startsRun || audioBroken, playedAtUptimeNanos: playedAtUptimeNanos)
+    message.append(packet)
+    nextAudioSequence += 1
+    audioBroken = false
+    audioUnsent += 1
+    stream.send(content: message, contentContext: .defaultStream, isComplete: false, completion: .contentProcessed { [weak self, weak stream] error in
+      guard let self else { return }
+      self.audioUnsent -= 1
+      guard error != nil else { return }
+      self.audioBroken = true
+      // A stream that failed carries nothing more; the next packet opens another.
+      if let stream, self.audioStream === stream {
+        stream.cancel()
+        self.audioStream = nil
+      }
+    })
+    window.audioPackets += 1
+    window.audioBytes += message.count
+  }
+
   /// Cancels the streams of frames the client has not acknowledged: after a keyframe it can
   /// decode without them.
   private func cancelInFlight() {
@@ -805,7 +894,7 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     timer.schedule(deadline: .now() + interval, repeating: interval)
     timer.setEventHandler { [weak self] in
       guard let self else { return }
-      if self.window.frames > 0 || self.window.cancelled > 0 {
+      if self.window.frames > 0 || self.window.cancelled > 0 || self.window.audioPackets > 0 {
         self.logger.log("QUIC video: \(self.summary(of: self.window, over: interval)), \(self.inFlight.count) in flight")
       }
       self.accumulate(self.window)
@@ -823,6 +912,9 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     total.cancelled += stats.cancelled
     total.roundTripNanos += stats.roundTripNanos
     total.roundTripMaxNanos = max(total.roundTripMaxNanos, stats.roundTripMaxNanos)
+    total.audioPackets += stats.audioPackets
+    total.audioBytes += stats.audioBytes
+    total.audioDropped += stats.audioDropped
   }
 
   private func summary(of stats: Stats, over seconds: Double? = nil) -> String {
@@ -836,6 +928,13 @@ final class QUICVideoSession: TimedFrameConsumer, @unchecked Sendable {
     }
     parts.append(String(format: "ack RTT avg %.1f ms max %.1f ms", averageRoundTrip, Double(stats.roundTripMaxNanos) / 1e6))
     parts.append("\(stats.cancelled) stale cancelled")
+    if stats.audioPackets > 0 || stats.audioDropped > 0 {
+      if let seconds {
+        parts.append(String(format: "audio %d packets, %.0f kbit/s, %d dropped", stats.audioPackets, Double(stats.audioBytes) * 8 / seconds / 1000, stats.audioDropped))
+      } else {
+        parts.append("audio \(stats.audioPackets) packets, \(stats.audioBytes) bytes, \(stats.audioDropped) dropped")
+      }
+    }
     return parts.joined(separator: ", ")
   }
 }
