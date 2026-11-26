@@ -70,6 +70,29 @@ struct VideoToolboxEncoderSettings {
   let keyFrameInterval: Double
   let cadence: VideoStreamCadence
   let sink: VideoEncodeSink
+  /// The colour detail asked for. `encodedChroma` is what the codec can give.
+  let requestedChroma: VideoStreamChroma
+
+  /// HEVC encodes either; H.264 has no 4:4:4 profile in VideoToolbox, and JPEG does its own subsampling.
+  var encodedChroma: VideoStreamChroma {
+    if case .compressedVideo(withCodec: .hevc, _) = format {
+      return requestedChroma
+    }
+    return .subsampled
+  }
+
+  /// The profile VideoToolbox knows HEVC Main 4:4:4 10 by. It has no constant in the SDK.
+  static let hevcMain44410Profile = "HEVC_Main44410_AutoLevel"
+
+  /// The pixel format the encoder is fed for a chroma: bi-planar, video range, 4:2:0 at 8 bits or 4:4:4 at 10.
+  static func encoderPixelFormat(for chroma: VideoStreamChroma) -> OSType {
+    switch chroma {
+    case .subsampled:
+      return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    case .full:
+      return kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+    }
+  }
 
   /// What H.264/HEVC output is tagged as, and what the converter is asked to produce for it. JPEG has
   /// nowhere in JFIF to carry a description and its YCbCr is BT.601 by convention, so the JPEG
@@ -87,6 +110,7 @@ struct VideoToolboxEncoderSettings {
     self.format = configuration.format
     self.rateControl = configuration.rateControl
     self.keyFrameInterval = configuration.keyFrameRate
+    self.requestedChroma = configuration.chroma
     self.cadence = cadence
     self.sink = sink
   }
@@ -128,8 +152,9 @@ struct VideoToolboxEncoderSettings {
     }
   }
 
-  /// The `VTSessionSetProperties` dictionary for a session encoding `outputWidth`×`outputHeight`.
-  func sessionProperties(outputWidth: Int, outputHeight: Int) -> [String: Any] {
+  /// The `VTSessionSetProperties` dictionary for a session encoding `outputWidth`×`outputHeight` at `chroma`
+  /// (nil for `encodedChroma`).
+  func sessionProperties(outputWidth: Int, outputHeight: Int, chroma: VideoStreamChroma? = nil) -> [String: Any] {
     var properties: [String: Any] = [
       kVTCompressionPropertyKey_RealTime as String: true,
       kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String: keyFrameInterval,
@@ -158,7 +183,12 @@ struct VideoToolboxEncoderSettings {
         properties[kVTCompressionPropertyKey_H264EntropyMode as String] = kVTH264EntropyMode_CABAC as String
       case .hevc:
         properties[kVTCompressionPropertyKey_AllowOpenGOP as String] = false
-        properties[kVTCompressionPropertyKey_ProfileLevel as String] = kVTProfileLevel_HEVC_Main_AutoLevel as String
+        switch chroma ?? encodedChroma {
+        case .subsampled:
+          properties[kVTCompressionPropertyKey_ProfileLevel as String] = kVTProfileLevel_HEVC_Main_AutoLevel as String
+        case .full:
+          properties[kVTCompressionPropertyKey_ProfileLevel as String] = Self.hevcMain44410Profile
+        }
       }
     case .mjpeg, .minicap, .bgra:
       switch rateControl {

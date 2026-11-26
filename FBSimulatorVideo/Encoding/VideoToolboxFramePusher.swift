@@ -12,6 +12,23 @@ import FBSimulatorControl
 import FBVideoCore
 import Foundation
 import VideoToolbox
+import os
+
+extension CMFormatDescription {
+  /// `chromaFormat` in an HEVC decoder configuration record for 4:4:4.
+  static let hevcChromaFormat444: UInt8 = 3
+
+  /// The chroma format an HEVC stream's decoder configuration record (`hvcC`) declares: 1 for 4:2:0, 2 for 4:2:2,
+  /// 3 for 4:4:4. nil when the description carries no such record.
+  var hevcChromaFormat: UInt8? {
+    let atoms = CMFormatDescriptionGetExtension(self, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any]
+    // The record's 17th byte: two bits of chroma format under six reserved ones.
+    guard let record = atoms?["hvcC"] as? Data, record.count > 16 else {
+      return nil
+    }
+    return record[record.startIndex + 16] & 0x3
+  }
+}
 
 /// Errors from the VideoToolbox sessions a `VideoToolboxFramePusher` (and `PixelBufferConverter`) drives.
 enum VideoToolboxFramePusherError: Error {
@@ -22,6 +39,7 @@ enum VideoToolboxFramePusherError: Error {
   case failedToPrepareCompressionSession(status: OSStatus)
   case missingCompressionSession
   case failedToCompress(status: OSStatus)
+  case fullChromaNotEncoded
 }
 
 extension VideoToolboxFramePusherError: LocalizedError {
@@ -41,11 +59,13 @@ extension VideoToolboxFramePusherError: LocalizedError {
       return "No compression session"
     case .failedToCompress(let status):
       return "Failed to compress \(status)"
+    case .fullChromaNotEncoded:
+      return "The encoder took the 4:4:4 profile but did not encode 4:4:4"
     }
   }
 }
 
-/// Encodes frames via a VTCompressionSession (BGRA→NV12 via `PixelBufferConverter`) and hands each
+/// Encodes frames via a VTCompressionSession (BGRA→YCbCr via `PixelBufferConverter`) and hands each
 /// encoded sample to an `EncodedSampleConsumer` — a transport writer, a JPEG framer or a file
 /// writer. Outcomes are accounted for by `EncoderStatsRecorder`.
 ///
@@ -66,7 +86,7 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
   let logger: any ControlCoreLogger
 
   var compressionSession: VTCompressionSession?
-  /// BGRA→NV12 at the encoded output size; nil until `setup`.
+  /// BGRA→YCbCr, in the encoder's input format at the encoded output size; nil until `setup`.
   private var converter: PixelBufferConverter?
   let statsRecorder: EncoderStatsRecorder
 
@@ -109,22 +129,43 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
 
     let sourceWidth = source.width
     let sourceHeight = source.height
-    // The composited frame includes the edge insets, so the NV12 pool and compression session must
+    // The composited frame includes the edge insets, so the converter's pool and compression session must
     // accommodate the full output size — the same `VideoOutputDimensions` the composited pool uses.
     let dimensions = VideoOutputDimensions.calculate(
       sourceWidth: sourceWidth, sourceHeight: sourceHeight,
       scaleFactor: scaleFactor, edgeInsets: edgeInsets)
-    let destinationWidth = dimensions.width
-    let destinationHeight = dimensions.height
     if let scaleFactor, scaleFactor > 0, scaleFactor < 1 {
-      logger.info().log("Applying \(scaleFactor) scale from w=\(sourceWidth)/h=\(sourceHeight) to output w=\(destinationWidth)/h=\(destinationHeight)")
+      logger.info().log("Applying \(scaleFactor) scale from w=\(sourceWidth)/h=\(sourceHeight) to output w=\(dimensions.width)/h=\(dimensions.height)")
     }
 
+    let pipeline: (converter: PixelBufferConverter, session: VTCompressionSession)
+    switch settings.encodedChroma {
+    case .subsampled:
+      pipeline = try makePipeline(dimensions: dimensions, chroma: .subsampled, encoderSpecification: encoderSpecification)
+    case .full:
+      // Not every hardware encoder has the 4:4:4 profile; one without it still streams, in 4:2:0.
+      do {
+        pipeline = try makePipeline(dimensions: dimensions, chroma: .full, encoderSpecification: encoderSpecification)
+      } catch {
+        logger.log("This encoder cannot encode 4:4:4 (\(error.localizedDescription)); encoding 4:2:0 instead")
+        pipeline = try makePipeline(dimensions: dimensions, chroma: .subsampled, encoderSpecification: encoderSpecification)
+      }
+    }
+    self.converter = pipeline.converter
+    self.compressionSession = pipeline.session
+  }
+
+  /// The converter and the compression session for one chroma, set up and ready to encode. Whatever was made
+  /// before a step failed is released again.
+  private func makePipeline(
+    dimensions: VideoOutputDimensions, chroma: VideoStreamChroma, encoderSpecification: [String: Any]
+  ) throws -> (converter: PixelBufferConverter, session: VTCompressionSession) {
+    let destinationWidth = dimensions.width
+    let destinationHeight = dimensions.height
     let converter = try PixelBufferConverter(
-      outputWidth: destinationWidth, outputHeight: destinationHeight, pixelFormat: PixelBufferConverter.encoderPixelFormat,
+      outputWidth: destinationWidth, outputHeight: destinationHeight, pixelFormat: VideoToolboxEncoderSettings.encoderPixelFormat(for: chroma),
       destinationColor: settings.colorDescription)
-    self.converter = converter
-    logger.info().log("Created BGRA→NV12 conversion pipeline at w=\(destinationWidth)/h=\(destinationHeight) (GPU via VTPixelTransferSession)")
+    logger.info().log("Created BGRA→YCbCr \(chroma.rawValue) conversion pipeline at w=\(destinationWidth)/h=\(destinationHeight) (GPU via VTPixelTransferSession)")
 
     // No create-time output callback: each frame is encoded with the block-based
     // `VTCompressionSessionEncodeFrame(...outputHandler:)` overload (see `writeEncodedFrame`),
@@ -149,17 +190,62 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
       logger.info().log("Hardware compression session refused (\(status)); retrying with a software encoder allowed")
       status = createCompressionSession(fallback)
     }
-    if status != noErr {
+    guard status == noErr else {
+      converter.invalidate()
       throw VideoToolboxFramePusherError.failedToStartCompressionSession(status: status)
     }
     guard let compressionSession else {
+      converter.invalidate()
       throw VideoToolboxFramePusherError.compressionSessionNil
     }
+    do {
+      try configure(compressionSession, dimensions: dimensions, chroma: chroma)
+      if chroma == .full, !encodesFullChroma(compressionSession, converter: converter) {
+        throw VideoToolboxFramePusherError.fullChromaNotEncoded
+      }
+    } catch {
+      VTCompressionSessionInvalidate(compressionSession)
+      converter.invalidate()
+      throw error
+    }
+    return (converter, compressionSession)
+  }
 
-    let sessionProperties = settings.sessionProperties(outputWidth: destinationWidth, outputHeight: destinationHeight)
+  /// Whether the session's output really is 4:4:4. An encoder takes the name of a profile it does not have without
+  /// complaint, and that name reads back as set, so the only proof is a frame: one is encoded here and the chroma
+  /// format its parameter sets declare is read. The frame is a keyframe whose output is dropped, as in `warm`, which
+  /// also spares the first real frame the encoder's start-up.
+  private func encodesFullChroma(_ compressionSession: VTCompressionSession, converter: PixelBufferConverter) -> Bool {
+    guard let frame = converter.makeOutputBuffer() else {
+      return false
+    }
+    let chromaFormat = OSAllocatedUnfairLock<UInt8?>(initialState: nil)
+    let status = VTCompressionSessionEncodeFrame(
+      compressionSession,
+      imageBuffer: frame,
+      presentationTimeStamp: .zero,
+      duration: .invalid,
+      frameProperties: [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary,
+      infoFlagsOut: nil,
+      outputHandler: { status, _, sampleBuffer in
+        guard status == noErr, let sampleBuffer, let format = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+          return
+        }
+        chromaFormat.withLock { $0 = format.hevcChromaFormat }
+      }
+    )
+    guard status == noErr else {
+      return false
+    }
+    VTCompressionSessionCompleteFrames(compressionSession, untilPresentationTimeStamp: .invalid)
+    return chromaFormat.withLock { $0 } == CMFormatDescription.hevcChromaFormat444
+  }
+
+  private func configure(_ compressionSession: VTCompressionSession, dimensions: VideoOutputDimensions, chroma: VideoStreamChroma) throws {
+    let sessionProperties = settings.sessionProperties(outputWidth: dimensions.width, outputHeight: dimensions.height, chroma: chroma)
     if case .compressedVideo = settings.format {
       logger.info().log(
-        "Rate control \(settings.rateControl) resolved to \(sessionProperties[kVTCompressionPropertyKey_AverageBitRate as String] ?? 0) bps average for w=\(destinationWidth)/h=\(destinationHeight)")
+        "Rate control \(settings.rateControl) resolved to \(sessionProperties[kVTCompressionPropertyKey_AverageBitRate as String] ?? 0) bps average for w=\(dimensions.width)/h=\(dimensions.height), chroma \(chroma.rawValue)")
     }
 
     let propertiesStatus = VTSessionSetProperties(compressionSession, propertyDictionary: sessionProperties as CFDictionary)
@@ -170,7 +256,6 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
     if prepareStatus != noErr {
       throw VideoToolboxFramePusherError.failedToPrepareCompressionSession(status: prepareStatus)
     }
-    self.compressionSession = compressionSession
   }
 
   func tearDown() throws {
@@ -212,16 +297,16 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
     let encodeStart = ContinuousClock.now
     statsRecorder.recordSubmissionStarting(at: encodeStart)
 
-    // BGRA→NV12 (and scale, since the pool is destination-sized) in one pass; on failure the encoder
+    // BGRA→YCbCr (and scale, since the pool is destination-sized) in one pass; on failure the encoder
     // takes the BGRA frame and converts internally.
     if let converter {
       switch converter.convert(pixelBuffer) {
-      case let .converted(nv12Buffer):
-        bufferToWrite = nv12Buffer
+      case let .converted(convertedBuffer):
+        bufferToWrite = convertedBuffer
       case let .transferFailed(status):
-        logger.log("VTPixelTransferSession BGRA→NV12 failed: \(status) — falling back to BGRA input")
+        logger.log("VTPixelTransferSession BGRA→YCbCr failed: \(status) — falling back to BGRA input")
       case let .poolExhausted(status):
-        logger.log("Failed to get a pixel buffer from the NV12 pool: \(status)")
+        logger.log("Failed to get a pixel buffer from the converter's pool: \(status)")
       }
     }
 

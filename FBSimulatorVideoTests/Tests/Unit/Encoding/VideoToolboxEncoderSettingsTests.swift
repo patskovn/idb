@@ -23,10 +23,11 @@ final class VideoToolboxEncoderSettingsTests: XCTestCase {
     rateControl: VideoStreamRateControl? = nil,
     framesPerSecond: Int? = nil,
     keyFrameRate: Double? = nil,
+    chroma: VideoStreamChroma = .subsampled,
     sink: VideoEncodeSink = .live
   ) -> VideoToolboxEncoderSettings {
     let configuration = VideoStreamConfiguration(
-      format: format, framesPerSecond: framesPerSecond, rateControl: rateControl, scaleFactor: nil, keyFrameRate: keyFrameRate)
+      format: format, framesPerSecond: framesPerSecond, rateControl: rateControl, scaleFactor: nil, keyFrameRate: keyFrameRate, chroma: chroma)
     let cadence: VideoStreamCadence = framesPerSecond.map { .eager(framesPerSecond: UInt($0)) } ?? .lazy
     return VideoToolboxEncoderSettings(configuration: configuration, cadence: cadence, sink: sink)
   }
@@ -140,6 +141,28 @@ final class VideoToolboxEncoderSettingsTests: XCTestCase {
     let props = retinaProperties(settings(h264))
     XCTAssertEqual(props[kVTCompressionPropertyKey_ProfileLevel as String] as? String, kVTProfileLevel_H264_High_AutoLevel as String)
     XCTAssertEqual(props[kVTCompressionPropertyKey_H264EntropyMode as String] as? String, kVTH264EntropyMode_CABAC as String)
+  }
+
+  func testHEVCFullChromaIsTheMain44410ProfileFedTenBit444() {
+    let full = settings(hevc, chroma: .full)
+    XCTAssertEqual(full.encodedChroma, .full)
+    XCTAssertEqual(retinaProperties(full)[kVTCompressionPropertyKey_ProfileLevel as String] as? String, "HEVC_Main44410_AutoLevel")
+    XCTAssertEqual(VideoToolboxEncoderSettings.encoderPixelFormat(for: .full), kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
+    XCTAssertEqual(VideoToolboxEncoderSettings.encoderPixelFormat(for: .subsampled), kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+  }
+
+  func testFullChromaFallsBackToTheMainProfileWhenAskedFor420() {
+    // What the pusher asks for when the encoder turns out not to encode 4:4:4.
+    let props = settings(hevc, chroma: .full).sessionProperties(outputWidth: Self.retinaWidth, outputHeight: Self.retinaHeight, chroma: .subsampled)
+    XCTAssertEqual(props[kVTCompressionPropertyKey_ProfileLevel as String] as? String, kVTProfileLevel_HEVC_Main_AutoLevel as String)
+  }
+
+  func testOnlyHEVCEncodesFullChroma() {
+    // VideoToolbox has no 4:4:4 profile for H.264, and JPEG subsamples as it pleases.
+    let h264Settings = settings(h264, chroma: .full)
+    XCTAssertEqual(h264Settings.encodedChroma, .subsampled)
+    XCTAssertEqual(retinaProperties(h264Settings)[kVTCompressionPropertyKey_ProfileLevel as String] as? String, kVTProfileLevel_H264_High_AutoLevel as String)
+    XCTAssertEqual(settings(mjpeg, chroma: .full).encodedChroma, .subsampled)
   }
 
   func testHEVCProfileAndClosedGOP() {

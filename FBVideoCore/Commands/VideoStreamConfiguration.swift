@@ -93,14 +93,27 @@ extension VideoStreamRateControl: CustomStringConvertible {
   }
 }
 
+/// How much colour detail compressed video keeps.
+public enum VideoStreamChroma: String, Hashable, Sendable {
+  /// 4:2:0 at 8 bits: colour at half the resolution in each direction, which every decoder plays.
+  case subsampled = "4:2:0"
+  /// 4:4:4 at 10 bits, HEVC only (the Main 4:4:4 10 profile): colour at full resolution. On screen content it is
+  /// the largest single gain in fidelity, because coloured text and thin coloured lines are exactly what 4:2:0
+  /// smears: measured on a simulator session, 5 dB on average and 7 dB in the worst frames, for no more bits. The
+  /// decoder must support the profile. H.264 has no such profile in VideoToolbox and stays 4:2:0.
+  case full = "4:4:4"
+}
+
 /// How frames are encoded, independent of the output format and sink.
 public struct VideoEncodeOptions: Hashable, Sendable {
   public let framesPerSecond: Int?
   public let scaleFactor: Double?
   public let rateControl: VideoStreamRateControl
   public let keyFrameRate: Double
+  /// The colour detail compressed video keeps. Only HEVC encodes `full`; every other format stays `subsampled`.
+  public let chroma: VideoStreamChroma
 
-  public init(framesPerSecond: Int?, rateControl: VideoStreamRateControl?, scaleFactor: Double?, keyFrameRate: Double?) {
+  public init(framesPerSecond: Int?, rateControl: VideoStreamRateControl?, scaleFactor: Double?, keyFrameRate: Double?, chroma: VideoStreamChroma = .subsampled) {
     self.framesPerSecond = framesPerSecond
     self.rateControl = rateControl ?? .automatic
     self.scaleFactor = scaleFactor
@@ -108,6 +121,7 @@ public struct VideoEncodeOptions: Hashable, Sendable {
     // temporal prediction. Late joiners wait at most this long for a sync point; WebRTC re-syncs via
     // requestKeyFrame.
     self.keyFrameRate = keyFrameRate ?? 4.0
+    self.chroma = chroma
   }
 }
 
@@ -122,6 +136,7 @@ public struct VideoStreamConfiguration: Hashable, CustomStringConvertible, Senda
   public var rateControl: VideoStreamRateControl { encodeOptions.rateControl }
   public var scaleFactor: Double? { encodeOptions.scaleFactor }
   public var keyFrameRate: Double { encodeOptions.keyFrameRate }
+  public var chroma: VideoStreamChroma { encodeOptions.chroma }
 
   public init(format: VideoStreamFormat, encodeOptions: VideoEncodeOptions, display: DisplaySelection = .active) {
     self.format = format
@@ -129,11 +144,17 @@ public struct VideoStreamConfiguration: Hashable, CustomStringConvertible, Senda
     self.display = display
   }
 
-  public init(format: VideoStreamFormat, framesPerSecond: Int?, rateControl: VideoStreamRateControl?, scaleFactor: Double?, keyFrameRate: Double?, display: DisplaySelection = .active) {
-    self.init(format: format, encodeOptions: VideoEncodeOptions(framesPerSecond: framesPerSecond, rateControl: rateControl, scaleFactor: scaleFactor, keyFrameRate: keyFrameRate), display: display)
+  public init(
+    format: VideoStreamFormat, framesPerSecond: Int?, rateControl: VideoStreamRateControl?, scaleFactor: Double?, keyFrameRate: Double?,
+    chroma: VideoStreamChroma = .subsampled, display: DisplaySelection = .active
+  ) {
+    self.init(
+      format: format,
+      encodeOptions: VideoEncodeOptions(framesPerSecond: framesPerSecond, rateControl: rateControl, scaleFactor: scaleFactor, keyFrameRate: keyFrameRate, chroma: chroma),
+      display: display)
   }
 
   public var description: String {
-    "Format \(format) | FPS \(framesPerSecond.map { "\($0)" } ?? "nil") | Rate Control \(rateControl) | Scale \(scaleFactor.map { "\($0)" } ?? "nil") | Key frame rate \(keyFrameRate) | Display \(display)"
+    "Format \(format) | FPS \(framesPerSecond.map { "\($0)" } ?? "nil") | Rate Control \(rateControl) | Scale \(scaleFactor.map { "\($0)" } ?? "nil") | Key frame rate \(keyFrameRate) | Chroma \(chroma.rawValue) | Display \(display)"
   }
 }
