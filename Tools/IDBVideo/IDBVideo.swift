@@ -12,8 +12,9 @@ import GRPCNIOTransportHTTP2Posix
 import IDBGRPCSwift
 import os
 
-/// Streams a target's screen from an idb companion over QUIC and writes the Annex-B video to a
-/// file or stdout, for example into `ffplay -f hevc -`.
+/// Shows a simulator's screen in this terminal and drives it from here: the video is streamed
+/// from an idb companion over QUIC, decoded, and drawn with the kitty graphics protocol, the
+/// terminal's mouse and keyboard are sent back as input, and the simulator's sound is played.
 ///
 /// The session is started over the companion's gRPC port; the companion answers with a QUIC
 /// endpoint, the fingerprint of the certificate it will present and a token. The frames then
@@ -22,7 +23,8 @@ import os
 struct IDBVideo: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "idb-video",
-    abstract: "Stream a simulator's screen from idb_companion over QUIC.")
+    abstract: "Show a simulator's screen in this terminal and drive it from here.",
+    discussion: "The screen is streamed from idb_companion over QUIC and drawn with the kitty graphics protocol through shared memory, so the terminal must be on this machine and support it, as kitty, Ghostty and Rex do. The mouse on the picture is a finger on the screen, the wheel or trackpad scrolls, a right click is the Home button, the buttons drawn beside the picture are pressed by clicking them, and what is typed is typed on the device's hardware keyboard. What the simulator plays is heard on this Mac, and not on the companion's while it is.")
 
   enum Codec: String, ExpressibleByArgument {
     case hevc, h264
@@ -55,26 +57,33 @@ struct IDBVideo: AsyncParsableCommand {
   @Option(help: "How long a gap in the frame sequence may stay open before asking for a keyframe, in milliseconds.")
   var gapTimeoutMs: Int = 100
 
-  @Flag(help: "Write frames without an access unit delimiter after each one. By default one is appended so ffplay, ffmpeg and mpv show each frame as soon as it arrives instead of when the next one starts.")
-  var noAud = false
-
-  @Flag(help: "Decode the video and draw it in this terminal with the kitty graphics protocol (shared memory), instead of writing the stream. Needs a terminal on this machine that supports it, such as kitty, Ghostty or Rex. The terminal then also drives the device: the mouse on the picture is a finger on the screen, the wheel or trackpad scrolls, a right click is the Home button, the Home, volume and lock buttons drawn beside the picture are pressed by clicking them, and what is typed is typed on the device's hardware keyboard.")
+  /// The only mode there is. Still accepted, for the commands that say it.
+  @Flag(help: .hidden)
   var kitty = false
 
-  @Flag(help: "With --kitty, only show the screen: nothing done in the terminal is sent to the device.")
+  @Flag(help: "Only show the screen: nothing done in the terminal is sent to the device, and no buttons are drawn.")
   var noControl = false
 
-  @Option(help: "With --kitty, append a line per thing done in the terminal, as it was read: the uptime in milliseconds, then the mouse report, key or text.")
+  @Option(help: "Append a line per thing done in the terminal, as it was read: the uptime in milliseconds, then the mouse report, key or text.")
   var inputLog: String?
 
-  @Option(help: "With --kitty, append a line per frame drawn: milliseconds to decode, to convert, to write to the terminal and from arrival to written, then 0, the size drawn and the uptime in nanoseconds.")
+  @Option(help: "Append a line per frame drawn: milliseconds to decode, to convert, to write to the terminal and from arrival to written, then 0, the size drawn and the uptime in nanoseconds.")
   var kittyLog: String?
+
+  @Flag(help: "Do not play the device's sound. By default what the simulator plays is heard on this Mac instead of on the companion's.")
+  var noAudio = false
+
+  @Option(help: "How long a sound waits before it plays, in milliseconds, for the rest of it to arrive in. Less is closer to the picture; too little and sound breaks up.")
+  var audioBufferMs: Int = 40
+
+  @Option(help: "Append a line per audio packet: uptime in nanoseconds, bytes, 1 when it starts a run, when it played on the companion's Mac (its uptime in nanoseconds), its peak level, and the milliseconds of sound waiting once it was added.")
+  var audioLog: String?
 
   @Option(help: "hevc or h264.")
   var codec: Codec = .hevc
 
-  @Option(help: "HEVC colour detail. 420 is 4:2:0 at 8 bits, which every decoder plays. 444 is 4:4:4 at 10 bits (HEVC Main 4:4:4 10): coloured text and thin coloured lines stay sharp, for about the same bitrate, but the decoder must support the profile (VideoToolbox on Apple silicon and ffmpeg do). Defaults to 444 with --kitty and 420 otherwise.")
-  var chroma: Chroma?
+  @Option(help: "HEVC colour detail. 420 is 4:2:0 at 8 bits, which every decoder plays. 444 is 4:4:4 at 10 bits (HEVC Main 4:4:4 10): coloured text and thin coloured lines stay sharp, for about the same bitrate, and needs a Mac that decodes the profile, as Apple silicon does.")
+  var chroma: Chroma = .full
 
   @Option(help: "A fixed frame rate. Without it, frames are sent when the screen changes.")
   var fps: UInt64?
@@ -88,9 +97,6 @@ struct IDBVideo: AsyncParsableCommand {
   @Option(help: "Seconds between periodic keyframes. Over QUIC there are none by default: the companion sends a keyframe when this client asks for one, which it does when it connects and when it has lost a frame.")
   var keyFrameRate: Double?
 
-  @Option(name: .shortAndLong, help: "Where to write the Annex-B stream: a file path, or - for stdout.")
-  var output = "-"
-
   @Option(help: "Stop after this many seconds.")
   var duration: Double?
 
@@ -100,7 +106,7 @@ struct IDBVideo: AsyncParsableCommand {
   @Option(help: "quic, or grpc to receive the frames on the gRPC call itself (for comparison).")
   var transport: Transport = .quic
 
-  @Option(help: "Append a line per frame written: uptime in nanoseconds, bytes, and 1 for a keyframe.")
+  @Option(help: "Append a line per frame handed to the decoder: uptime in nanoseconds, bytes, and 1 for a keyframe.")
   var frameLog: String?
 
   mutating func run() async throws {
@@ -109,15 +115,17 @@ struct IDBVideo: AsyncParsableCommand {
     guard let quicHost = quicHost ?? defaultQUICHost ?? (transport == .grpc ? "" : nil) else {
       throw ValidationError("--quic-host is required with a unix socket companion")
     }
-    let output = try openOutput()
-    let kittyOutput = output as? KittyTerminalOutput
-    kittyOutput?.start()
-    defer { kittyOutput?.finish() }
+    guard isatty(STDOUT_FILENO) == 1 else {
+      throw ValidationError("idb-video draws in the terminal, so stdout must be one")
+    }
+    let kittyOutput = try KittyTerminalOutput(isHEVC: codec == .hevc, showsButtons: !noControl && isatty(STDIN_FILENO) == 1, frameLogPath: kittyLog)
+    kittyOutput.start()
+    defer { kittyOutput.finish() }
     // The mouse and keyboard in the terminal drive the device, unless this is only for watching
     // or there is no terminal to read them from.
     var controller: DeviceController?
     var terminalInput: TerminalInput?
-    if let kittyOutput, !noControl {
+    if !noControl {
       let deviceController = DeviceController(
         geometry: { kittyOutput.pictureGeometry }, buttonChanged: { kittyOutput.setPressed($0, $1) })
       let inputLog = try inputLog.map(InputLog.init(path:))
@@ -137,10 +145,10 @@ struct IDBVideo: AsyncParsableCommand {
     let quicConnectOverride = try quicConnect.map(parseHostPort)
     let maxUDPPayload = quicMaxUDPPayload
     let gapTimeout = gapTimeoutMs
-    // HEVC AUD (type 35, pic_type 2) / H.264 AUD (type 9, primary_pic_type 7).
-    let accessUnitDelimiter: Data? = noAud ? nil : Data(codec == .hevc ? [0, 0, 0, 1, 0x46, 0x01, 0x50] : [0, 0, 0, 1, 0x09, 0xF0])
     let codec = codec
-    let fullChroma = codec == .hevc && (chroma ?? (kitty ? .full : .subsampled)) == .full
+    let fullChroma = codec == .hevc && chroma == .full
+    // The sound travels in the QUIC session.
+    let wantsAudio = !noAudio && transport == .quic
     let start = Idb_VideoStreamRequest.with {
       $0.start = .with {
         $0.transport = transport == .quic ? .quic : .grpc
@@ -151,8 +159,12 @@ struct IDBVideo: AsyncParsableCommand {
         $0.avgBitrate = bitrate ?? 0
         $0.keyFrameRate = keyFrameRate ?? 0
         $0.chroma = fullChroma ? .chroma444 : .chroma420
+        $0.audio = wantsAudio
       }
     }
+
+    let audioBufferMs = audioBufferMs
+    let audioLog = audioLog
 
     let (controlMessages, control) = AsyncStream<Idb_VideoStreamRequest>.makeStream()
     control.yield(start)
@@ -185,8 +197,8 @@ struct IDBVideo: AsyncParsableCommand {
       }
     }
 
-    // With --kitty the picture fills the terminal that stderr usually also writes to.
-    let statsInterval = kitty && isatty(STDERR_FILENO) == 1 ? 0 : statsInterval
+    // The picture fills the terminal that stderr usually also writes to.
+    let statsInterval = isatty(STDERR_FILENO) == 1 ? 0 : statsInterval
     let requestedTransport = transport
     // No gRPC keepalive: the companion's server allows one ping per 5 minutes and closes the
     // connection after a few more while no data flows (a still screen). A dead network is noticed
@@ -220,7 +232,7 @@ struct IDBVideo: AsyncParsableCommand {
             }
           }
         }
-        if let kittyOutput, controller != nil {
+        if controller != nil {
           // Where the buttons are on this device's body, to draw them there. A companion without
           // the call, or a device with no body described, leaves them where they are by default.
           group.addTask {
@@ -239,7 +251,11 @@ struct IDBVideo: AsyncParsableCommand {
           }
         ) { response in
           var receiver: QUICVideoReceiver?
-          defer { receiver?.stop() }
+          var audio: AudioPlayer?
+          defer {
+            receiver?.stop()
+            audio?.stop()
+          }
           var payloadStats = PayloadStats(interval: statsInterval)
           var payloadSequence: UInt64 = 0
           for try await message in response.messages {
@@ -257,10 +273,13 @@ struct IDBVideo: AsyncParsableCommand {
                 log("connecting QUIC through \(quicHost):\(port) instead of the offered port \(session.port)")
               }
               log("QUIC session on \(quicHost):\(port), certificate sha256 \(session.certificateSha256.map { String(format: "%02x", $0) }.joined())")
+              if wantsAudio {
+                audio = Self.audioPlayer(for: session, bufferMilliseconds: audioBufferMs, packetLogPath: audioLog) { kittyOutput.setNotice($0) }
+              }
               let newReceiver = QUICVideoReceiver(
                 host: quicHost, port: port, alpn: session.alpn, certificateSHA256: session.certificateSha256, token: session.token,
-                output: output, frameLog: frameLog, statsInterval: statsInterval, maxUDPPayloadSize: maxUDPPayload,
-                gapTimeoutMilliseconds: gapTimeout, accessUnitDelimiter: accessUnitDelimiter, onEnd: stop)
+                output: kittyOutput, audio: audio, frameLog: frameLog, statsInterval: statsInterval, maxUDPPayloadSize: maxUDPPayload,
+                gapTimeoutMilliseconds: gapTimeout, onEnd: stop)
               newReceiver.start()
               receiver = newReceiver
             case let .logOutput(data):
@@ -277,12 +296,7 @@ struct IDBVideo: AsyncParsableCommand {
                 continue
               }
               let isKeyFrame = AnnexBKeyFrameDetector.isKeyFrame(frame, codec: codec)
-              do {
-                try output.writeFrame(accessUnitDelimiter.map { frame + $0 } ?? frame)
-              } catch {
-                stop("cannot write the video: \(error)")
-                continue
-              }
+              kittyOutput.writeFrame(frame)
               let receivedAt = DispatchTime.now().uptimeNanoseconds
               frameLog?.record(bytes: frame.count, isKeyFrame: isKeyFrame, sequence: payloadSequence, capturedAt: 0, receivedAt: receivedAt)
               payloadSequence += 1
@@ -293,6 +307,33 @@ struct IDBVideo: AsyncParsableCommand {
           }
         }
       }
+    }
+  }
+
+  /// The player for the session's sound, or nil with the reason shown when there will be none.
+  private static func audioPlayer(
+    for session: Idb_VideoStreamResponse.QuicSession, bufferMilliseconds: Int, packetLogPath: String?, notice: (String) -> Void
+  ) -> AudioPlayer? {
+    guard session.hasAudio else {
+      log("no sound: the companion does not send audio. Rebuild and restart idb_companion from the quic-video branch, or pass --no-audio.")
+      notice("No sound: this companion does not send audio")
+      return nil
+    }
+    guard session.audio.unavailableReason.isEmpty else {
+      log("no sound: \(session.audio.unavailableReason)")
+      notice("No sound: \(session.audio.unavailableReason)")
+      return nil
+    }
+    do {
+      let player = try AudioPlayer(
+        sampleRate: Int(session.audio.sampleRate), channels: Int(session.audio.channels), framesPerPacket: Int(session.audio.framesPerPacket),
+        bufferMilliseconds: bufferMilliseconds, packetLogPath: packetLogPath)
+      try player.start()
+      return player
+    } catch {
+      log("no sound: \(error.localizedDescription)")
+      notice("No sound: \(error.localizedDescription)")
+      return nil
     }
   }
 
@@ -319,25 +360,6 @@ struct IDBVideo: AsyncParsableCommand {
       host = String(host.dropFirst().dropLast())
     }
     return (host, port)
-  }
-
-  private func openOutput() throws -> any FrameOutput {
-    if kitty {
-      guard output == "-" else {
-        throw ValidationError("--kitty draws in the terminal, so it cannot be combined with --output")
-      }
-      guard isatty(STDOUT_FILENO) == 1 else {
-        throw ValidationError("--kitty needs stdout to be a terminal")
-      }
-      return try KittyTerminalOutput(isHEVC: codec == .hevc, showsButtons: !noControl && isatty(STDIN_FILENO) == 1, frameLogPath: kittyLog)
-    }
-    if output == "-" {
-      return FileHandle.standardOutput
-    }
-    guard FileManager.default.createFile(atPath: output, contents: nil) else {
-      throw ValidationError("Cannot create \(output)")
-    }
-    return try FileHandle(forWritingTo: URL(fileURLWithPath: output))
   }
 
   private func installSignalHandlers(_ handler: @escaping @Sendable () -> Void) -> [any DispatchSourceSignal] {

@@ -19,7 +19,44 @@ enum QUICVideoWire {
   static let streamFrameHeaderLength = 24
   static let version: UInt8 = 1
   static let keyFrameFlag: UInt8 = 1 << 0
+  /// The audio stream: version 3, a 24-byte header before each Opus packet (see the companion).
+  static let audioVersion: UInt8 = 3
+  static let audioPacketHeaderLength = 24
+  static let audioStartsRunFlag: UInt8 = 1 << 0
   static let idleTimeoutMilliseconds = 30_000
+
+  /// One packet off the front of an audio stream's bytes.
+  struct AudioPacket: Equatable {
+    let sequence: UInt64
+    let startsRun: Bool
+    let playedAtUptimeNanos: UInt64
+    let payload: Data
+  }
+
+  /// Takes every complete audio packet off the front of `buffer`. Returns nil, leaving the buffer
+  /// as it was, when the bytes are not an audio stream's.
+  static func takeAudioPackets(from buffer: inout Data) -> [AudioPacket]? {
+    var packets: [AudioPacket] = []
+    var offset = buffer.startIndex
+    while buffer.endIndex - offset >= audioPacketHeaderLength {
+      let header = [UInt8](buffer[offset..<(offset + audioPacketHeaderLength)])
+      guard header[0] == audioVersion else {
+        return nil
+      }
+      let length = Int(uint64(bigEndian: header[4..<8]))
+      let end = offset + audioPacketHeaderLength + length
+      guard buffer.endIndex >= end else {
+        break
+      }
+      packets.append(
+        AudioPacket(
+          sequence: uint64(bigEndian: header[8..<16]), startsRun: header[1] & audioStartsRunFlag != 0,
+          playedAtUptimeNanos: uint64(bigEndian: header[16..<24]), payload: buffer.subdata(in: (offset + audioPacketHeaderLength)..<end)))
+      offset = end
+    }
+    buffer = Data(buffer[offset...])
+    return packets
+  }
 
   enum Control: UInt8 {
     case ack = 1
@@ -36,7 +73,8 @@ enum QUICVideoWire {
   }
 }
 
-/// Receives a companion's QUIC video session and writes its frames, in order, as one Annex-B stream.
+/// Receives a companion's QUIC video session and hands its frames, in order, to what decodes and
+/// draws them, and its audio packets to what plays them.
 ///
 /// Each frame arrives on a stream of its own, so a frame delayed by a lost packet does not hold up
 /// later ones, and the frames can complete out of order. They are written in sequence order. A
@@ -77,11 +115,9 @@ final class QUICVideoReceiver: @unchecked Sendable {
   private let alpn: String
   private let certificateSHA256: Data
   private let token: Data
-  private let output: any FrameOutput
+  private let output: KittyTerminalOutput
+  private let audio: AudioPlayer?
   private let frameLog: FrameLog?
-  /// Written after every frame so parser-based viewers (ffplay, ffmpeg, mpv) can end the access unit
-  /// at once instead of waiting for the next frame's start; nil to write frames bare.
-  private let accessUnitDelimiter: Data?
   /// Streams the companion has opened; with per-frame framing the stream limit is raised as they are used.
   private var incomingStreams = 0
   private let statsInterval: Double
@@ -104,14 +140,13 @@ final class QUICVideoReceiver: @unchecked Sendable {
   private var firstFrameLogged = false
 
   init(
-    host: String, port: UInt16, alpn: String, certificateSHA256: Data, token: Data, output: any FrameOutput, frameLog: FrameLog?,
+    host: String, port: UInt16, alpn: String, certificateSHA256: Data, token: Data, output: KittyTerminalOutput, audio: AudioPlayer? = nil,
+    frameLog: FrameLog?,
     statsInterval: Double,
     maxUDPPayloadSize: Int = 0,
     gapTimeoutMilliseconds: Int = 100,
-    accessUnitDelimiter: Data? = nil,
     onEnd: @escaping @Sendable (String) -> Void
   ) {
-    self.accessUnitDelimiter = accessUnitDelimiter
     self.maxUDPPayloadSize = maxUDPPayloadSize
     self.gapTimeout = .milliseconds(gapTimeoutMilliseconds)
     self.host = host
@@ -120,6 +155,7 @@ final class QUICVideoReceiver: @unchecked Sendable {
     self.certificateSHA256 = certificateSHA256
     self.token = token
     self.output = output
+    self.audio = audio
     self.frameLog = frameLog
     self.statsInterval = statsInterval
     self.onEnd = onEnd
@@ -274,6 +310,24 @@ final class QUICVideoReceiver: @unchecked Sendable {
       }
       if let content {
         buffer.data.append(content)
+      }
+      // The audio stream: packets follow one another on it until the session ends.
+      if buffer.data.first == QUICVideoWire.audioVersion {
+        if let packets = QUICVideoWire.takeAudioPackets(from: &buffer.data) {
+          for packet in packets {
+            self.audio?.receive(packet.payload, startsRun: packet.startsRun, playedAtUptimeNanos: packet.playedAtUptimeNanos)
+          }
+        } else {
+          log("ignoring a malformed audio stream")
+          stream.cancel()
+          return
+        }
+        if error != nil || isComplete {
+          stream.cancel()
+        } else {
+          self.read(stream, buffer: buffer)
+        }
+        return
       }
       // Single-stream framing: frames follow one another on this stream until the session ends.
       if buffer.data.first == QUICVideoWire.streamVersion {
@@ -453,19 +507,11 @@ final class QUICVideoReceiver: @unchecked Sendable {
   }
 
   private func write(_ frame: Frame) {
-    do {
-      if let accessUnitDelimiter {
-        try output.writeFrame(frame.payload + accessUnitDelimiter)
-      } else {
-        try output.writeFrame(frame.payload)
-      }
-      frameLog?.record(
-        bytes: frame.payload.count, isKeyFrame: frame.isKeyFrame, sequence: frame.sequence, capturedAt: frame.capturedAt,
-        receivedAt: frame.receivedAt)
-      window.written += 1
-    } catch {
-      end("cannot write the video: \(error)")
-    }
+    output.writeFrame(frame.payload)
+    frameLog?.record(
+      bytes: frame.payload.count, isKeyFrame: frame.isKeyFrame, sequence: frame.sequence, capturedAt: frame.capturedAt,
+      receivedAt: frame.receivedAt)
+    window.written += 1
   }
 
   // MARK: Timers

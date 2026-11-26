@@ -13,17 +13,6 @@ import IDBVideoShm
 import SwiftUI
 import VideoToolbox
 
-/// Where the receiver writes each Annex-B access unit, in order.
-protocol FrameOutput: AnyObject, Sendable {
-  func writeFrame(_ data: Data) throws
-}
-
-extension FileHandle: FrameOutput {
-  func writeFrame(_ data: Data) throws {
-    try write(contentsOf: data)
-  }
-}
-
 /// Decodes the stream with VideoToolbox and draws it in the terminal on stdout with the kitty
 /// graphics protocol.
 ///
@@ -42,7 +31,7 @@ extension FileHandle: FrameOutput {
 ///
 /// @unchecked Sendable: decoder state is confined to `decodeQueue`, conversion and drawing state to
 /// `presentQueue`, and the hand-off between them to `lock`.
-final class KittyTerminalOutput: FrameOutput, @unchecked Sendable {
+final class KittyTerminalOutput: @unchecked Sendable {
   /// A decoded frame on its way to the terminal.
   private struct DecodedFrame {
     let image: CVPixelBuffer
@@ -135,6 +124,7 @@ final class KittyTerminalOutput: FrameOutput, @unchecked Sendable {
   private var shmCounter = 0
   private var drawnFrames = 0
   private var drawnSignature: String?
+  private var notice: String?
   private var drawnLayout: Layout?
   private var pressedButtons: Set<DeviceButton> = []
   private var bodyButtons = DeviceBodyButtons()
@@ -208,6 +198,29 @@ final class KittyTerminalOutput: FrameOutput, @unchecked Sendable {
     }
   }
 
+  /// Shows a line of text on the terminal's last row, under the picture, for something the person
+  /// watching should know and stderr, which the picture covers, cannot tell them.
+  func setNotice(_ text: String) {
+    presentQueue.async {
+      self.notice = text
+      // Drawn when the terminal is laid out: now if there is a picture, else with the first frame.
+      if let image = self.lastPresented {
+        self.present(DecodedFrame(image: image, receivedAt: DispatchTime.now().uptimeNanoseconds, decodeNanos: 0), afterResize: true)
+      }
+    }
+  }
+
+  /// The notice as the sequence that draws it: dim, on the last row, cut to the terminal's width.
+  private func noticeDrawing() -> String {
+    var size = winsize()
+    guard let notice, ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0, size.ws_col > 1, size.ws_row > 1 else {
+      return ""
+    }
+    let columns = Int(size.ws_col)
+    let text = notice.count > columns ? notice.prefix(columns - 1) + "…" : Substring(notice)
+    return "\u{1b}[\(size.ws_row);1H\u{1b}[2m\(text)\u{1b}[0m"
+  }
+
   /// Writes a control sequence to the terminal, whole, between the frames.
   func writeControl(_ sequence: String) {
     writeToTerminal(Data(sequence.utf8))
@@ -237,7 +250,8 @@ final class KittyTerminalOutput: FrameOutput, @unchecked Sendable {
     }
   }
 
-  func writeFrame(_ data: Data) throws {
+  /// Takes the next Annex-B access unit of the stream, in order.
+  func writeFrame(_ data: Data) {
     let receivedAt = DispatchTime.now().uptimeNanoseconds
     decodeQueue.async { self.decode(data, receivedAt: receivedAt) }
   }
@@ -503,7 +517,7 @@ final class KittyTerminalOutput: FrameOutput, @unchecked Sendable {
     let clear =
       redraw
       ? "\u{1b}[2J" + Self.drawing(of: layout.buttons) + (homeImageCommand(for: layout) ?? "") + (volumeImageCommand(for: layout) ?? "")
-        + (lockImageCommand(for: layout) ?? "") + (cornersImageCommand(for: layout) ?? "") : ""
+        + (lockImageCommand(for: layout) ?? "") + (cornersImageCommand(for: layout) ?? "") + noticeDrawing() : ""
     var keys = "a=T,f=\(bytesPerPixel * 8),s=\(width),v=\(height),t=s,S=\(size),i=1,p=1,C=1,q=2"
     if let cells = layout.cells {
       keys += ",c=\(cells.columns),r=\(cells.rows)"
