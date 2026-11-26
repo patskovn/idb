@@ -30,6 +30,28 @@ final class FrameLog: @unchecked Sendable {
   }
 }
 
+/// Appends a line per thing done in the terminal, as it was read from it, for seeing what a terminal
+/// reports. Columns: host uptime in milliseconds, then the event.
+final class InputLog: @unchecked Sendable {
+  private let handle: FileHandle
+  private let lock = NSLock()
+
+  init(path: String) throws {
+    guard FileManager.default.createFile(atPath: path, contents: nil) else {
+      throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: path])
+    }
+    handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+  }
+
+  func record(_ events: [TerminalInputEvent]) {
+    let now = DispatchTime.now().uptimeNanoseconds / 1_000_000
+    let lines = events.map { "\(now) \($0)\n" }.joined()
+    lock.withLock {
+      handle.write(Data(lines.utf8))
+    }
+  }
+}
+
 /// Statistics lines for frames that arrive on the gRPC call, matching the QUIC receiver's.
 struct PayloadStats {
   private let interval: Double

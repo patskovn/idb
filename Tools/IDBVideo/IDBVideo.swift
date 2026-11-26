@@ -32,6 +32,11 @@ struct IDBVideo: AsyncParsableCommand {
     case quic, grpc
   }
 
+  enum Chroma: String, ExpressibleByArgument {
+    case subsampled = "420"
+    case full = "444"
+  }
+
   @Option(help: "The companion's gRPC address: host:port, or unix:<socket path>.")
   var companion = "localhost:10882"
 
@@ -53,11 +58,23 @@ struct IDBVideo: AsyncParsableCommand {
   @Flag(help: "Write frames without an access unit delimiter after each one. By default one is appended so ffplay, ffmpeg and mpv show each frame as soon as it arrives instead of when the next one starts.")
   var noAud = false
 
-  @Flag(help: "Decode the video and draw it in this terminal with the kitty graphics protocol (shared memory), instead of writing the stream. Needs a terminal on this machine that supports it, such as kitty, Ghostty or Rex.")
+  @Flag(help: "Decode the video and draw it in this terminal with the kitty graphics protocol (shared memory), instead of writing the stream. Needs a terminal on this machine that supports it, such as kitty, Ghostty or Rex. The terminal then also drives the device: the mouse on the picture is a finger on the screen, the wheel or trackpad scrolls, a right click is the Home button, the Home, volume and lock buttons drawn beside the picture are pressed by clicking them, and what is typed is typed on the device's hardware keyboard.")
   var kitty = false
+
+  @Flag(help: "With --kitty, only show the screen: nothing done in the terminal is sent to the device.")
+  var noControl = false
+
+  @Option(help: "With --kitty, append a line per thing done in the terminal, as it was read: the uptime in milliseconds, then the mouse report, key or text.")
+  var inputLog: String?
+
+  @Option(help: "With --kitty, append a line per frame drawn: milliseconds to decode, to convert, to write to the terminal and from arrival to written, then 0, the size drawn and the uptime in nanoseconds.")
+  var kittyLog: String?
 
   @Option(help: "hevc or h264.")
   var codec: Codec = .hevc
+
+  @Option(help: "HEVC colour detail. 420 is 4:2:0 at 8 bits, which every decoder plays. 444 is 4:4:4 at 10 bits (HEVC Main 4:4:4 10): coloured text and thin coloured lines stay sharp, for about the same bitrate, but the decoder must support the profile (VideoToolbox on Apple silicon and ffmpeg do). Defaults to 444 with --kitty and 420 otherwise.")
+  var chroma: Chroma?
 
   @Option(help: "A fixed frame rate. Without it, frames are sent when the screen changes.")
   var fps: UInt64?
@@ -68,7 +85,7 @@ struct IDBVideo: AsyncParsableCommand {
   @Option(help: "Average bitrate in bits per second.")
   var bitrate: Double?
 
-  @Option(help: "Seconds between periodic keyframes.")
+  @Option(help: "Seconds between periodic keyframes. Over QUIC there are none by default: the companion sends a keyframe when this client asks for one, which it does when it connects and when it has lost a frame.")
   var keyFrameRate: Double?
 
   @Option(name: .shortAndLong, help: "Where to write the Annex-B stream: a file path, or - for stdout.")
@@ -96,6 +113,26 @@ struct IDBVideo: AsyncParsableCommand {
     let kittyOutput = output as? KittyTerminalOutput
     kittyOutput?.start()
     defer { kittyOutput?.finish() }
+    // The mouse and keyboard in the terminal drive the device, unless this is only for watching
+    // or there is no terminal to read them from.
+    var controller: DeviceController?
+    var terminalInput: TerminalInput?
+    if let kittyOutput, !noControl {
+      let deviceController = DeviceController(
+        geometry: { kittyOutput.pictureGeometry }, buttonChanged: { kittyOutput.setPressed($0, $1) })
+      let inputLog = try inputLog.map(InputLog.init(path:))
+      let input = TerminalInput(
+        write: { kittyOutput.writeControl($0) },
+        handler: { events in
+          inputLog?.record(events)
+          deviceController.handle(events)
+        })
+      if input.start() {
+        controller = deviceController
+        terminalInput = input
+      }
+    }
+    defer { terminalInput?.stop() }
     let frameLog = try frameLog.map(FrameLog.init(path:))
     let quicConnectOverride = try quicConnect.map(parseHostPort)
     let maxUDPPayload = quicMaxUDPPayload
@@ -103,6 +140,7 @@ struct IDBVideo: AsyncParsableCommand {
     // HEVC AUD (type 35, pic_type 2) / H.264 AUD (type 9, primary_pic_type 7).
     let accessUnitDelimiter: Data? = noAud ? nil : Data(codec == .hevc ? [0, 0, 0, 1, 0x46, 0x01, 0x50] : [0, 0, 0, 1, 0x09, 0xF0])
     let codec = codec
+    let fullChroma = codec == .hevc && (chroma ?? (kitty ? .full : .subsampled)) == .full
     let start = Idb_VideoStreamRequest.with {
       $0.start = .with {
         $0.transport = transport == .quic ? .quic : .grpc
@@ -112,6 +150,7 @@ struct IDBVideo: AsyncParsableCommand {
         $0.scaleFactor = scale ?? 0
         $0.avgBitrate = bitrate ?? 0
         $0.keyFrameRate = keyFrameRate ?? 0
+        $0.chroma = fullChroma ? .chroma444 : .chroma420
       }
     }
 
@@ -155,64 +194,102 @@ struct IDBVideo: AsyncParsableCommand {
     let transport = try HTTP2ClientTransport.Posix(target: target, transportSecurity: .plaintext)
     try await withGRPCClient(transport: transport) { client in
       let service = Idb_CompanionService.Client(wrapping: client)
-      try await service.video_stream(
-        request: StreamingClientRequest { writer in
-          for await message in controlMessages {
-            try await writer.write(message)
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        if let controller {
+          // Each gesture is a `hid` call of its own, made in turn on the connection the stream was asked for on.
+          group.addTask {
+            await controller.run { events in
+              _ = try await service.hid(requestProducer: { writer in
+                for await event in events {
+                  try await writer.write(event)
+                }
+              })
+            }
+          }
+          // Touches are given in points of the device's screen, which only the companion knows the size of.
+          group.addTask {
+            do {
+              let screen = try await service.describe(Idb_TargetDescriptionRequest()).targetDescription.screenDimensions
+              guard screen.widthPoints > 0, screen.heightPoints > 0 else {
+                log("the companion did not say how large the device's screen is, so input is not sent to it")
+                return
+              }
+              controller.setScreen(widthPoints: Double(screen.widthPoints), heightPoints: Double(screen.heightPoints))
+            } catch {
+              log("cannot ask the companion how large the device's screen is, so input is not sent to it: \(error)")
+            }
           }
         }
-      ) { response in
-        var receiver: QUICVideoReceiver?
-        defer { receiver?.stop() }
-        var payloadStats = PayloadStats(interval: statsInterval)
-        var payloadSequence: UInt64 = 0
-        for try await message in response.messages {
-          switch message.output {
-          case let .quicSession(session):
-            guard receiver == nil else {
-              continue
+        if let kittyOutput, controller != nil {
+          // Where the buttons are on this device's body, to draw them there. A companion without
+          // the call, or a device with no body described, leaves them where they are by default.
+          group.addTask {
+            if let chrome = try? await service.device_chrome(Idb_DeviceChromeRequest()) {
+              kittyOutput.setBodyButtons(DeviceBodyButtons(chrome: chrome))
             }
-            guard var port = UInt16(exactly: session.port) else {
-              throw ValidationError("The companion offered an invalid QUIC port \(session.port)")
+          }
+        }
+        // Ends the controller's task, which the group waits for.
+        defer { controller?.finish() }
+        try await service.video_stream(
+          request: StreamingClientRequest { writer in
+            for await message in controlMessages {
+              try await writer.write(message)
             }
-            var quicHost = quicHost
-            if let override = quicConnectOverride {
-              (quicHost, port) = override
-              log("connecting QUIC through \(quicHost):\(port) instead of the offered port \(session.port)")
+          }
+        ) { response in
+          var receiver: QUICVideoReceiver?
+          defer { receiver?.stop() }
+          var payloadStats = PayloadStats(interval: statsInterval)
+          var payloadSequence: UInt64 = 0
+          for try await message in response.messages {
+            switch message.output {
+            case let .quicSession(session):
+              guard receiver == nil else {
+                continue
+              }
+              guard var port = UInt16(exactly: session.port) else {
+                throw ValidationError("The companion offered an invalid QUIC port \(session.port)")
+              }
+              var quicHost = quicHost
+              if let override = quicConnectOverride {
+                (quicHost, port) = override
+                log("connecting QUIC through \(quicHost):\(port) instead of the offered port \(session.port)")
+              }
+              log("QUIC session on \(quicHost):\(port), certificate sha256 \(session.certificateSha256.map { String(format: "%02x", $0) }.joined())")
+              let newReceiver = QUICVideoReceiver(
+                host: quicHost, port: port, alpn: session.alpn, certificateSHA256: session.certificateSha256, token: session.token,
+                output: output, frameLog: frameLog, statsInterval: statsInterval, maxUDPPayloadSize: maxUDPPayload,
+                gapTimeoutMilliseconds: gapTimeout, accessUnitDelimiter: accessUnitDelimiter, onEnd: stop)
+              newReceiver.start()
+              receiver = newReceiver
+            case let .logOutput(data):
+              FileHandle.standardError.write(data)
+            case let .payload(payload):
+              // The gRPC transport: each payload is one Annex-B access unit.
+              guard requestedTransport == .grpc else {
+                // A companion without QUIC support ignores the transport and the HEVC format and
+                // streams H.264 over gRPC, which would play as nothing.
+                throw ValidationError(
+                  "The companion streamed over gRPC instead of QUIC, so it does not support QUIC. Rebuild and restart idb_companion from the quic-video branch, or use --transport grpc --codec h264.")
+              }
+              guard case let .data(frame) = payload.source else {
+                continue
+              }
+              let isKeyFrame = AnnexBKeyFrameDetector.isKeyFrame(frame, codec: codec)
+              do {
+                try output.writeFrame(accessUnitDelimiter.map { frame + $0 } ?? frame)
+              } catch {
+                stop("cannot write the video: \(error)")
+                continue
+              }
+              let receivedAt = DispatchTime.now().uptimeNanoseconds
+              frameLog?.record(bytes: frame.count, isKeyFrame: isKeyFrame, sequence: payloadSequence, capturedAt: 0, receivedAt: receivedAt)
+              payloadSequence += 1
+              payloadStats.record(bytes: frame.count, isKeyFrame: isKeyFrame)
+            case nil:
+              break
             }
-            log("QUIC session on \(quicHost):\(port), certificate sha256 \(session.certificateSha256.map { String(format: "%02x", $0) }.joined())")
-            let newReceiver = QUICVideoReceiver(
-              host: quicHost, port: port, alpn: session.alpn, certificateSHA256: session.certificateSha256, token: session.token,
-              output: output, frameLog: frameLog, statsInterval: statsInterval, maxUDPPayloadSize: maxUDPPayload,
-              gapTimeoutMilliseconds: gapTimeout, accessUnitDelimiter: accessUnitDelimiter, onEnd: stop)
-            newReceiver.start()
-            receiver = newReceiver
-          case let .logOutput(data):
-            FileHandle.standardError.write(data)
-          case let .payload(payload):
-            // The gRPC transport: each payload is one Annex-B access unit.
-            guard requestedTransport == .grpc else {
-              // A companion without QUIC support ignores the transport and the HEVC format and
-              // streams H.264 over gRPC, which would play as nothing.
-              throw ValidationError(
-                "The companion streamed over gRPC instead of QUIC, so it does not support QUIC. Rebuild and restart idb_companion from the quic-video branch, or use --transport grpc --codec h264.")
-            }
-            guard case let .data(frame) = payload.source else {
-              continue
-            }
-            let isKeyFrame = AnnexBKeyFrameDetector.isKeyFrame(frame, codec: codec)
-            do {
-              try output.writeFrame(accessUnitDelimiter.map { frame + $0 } ?? frame)
-            } catch {
-              stop("cannot write the video: \(error)")
-              continue
-            }
-            let receivedAt = DispatchTime.now().uptimeNanoseconds
-            frameLog?.record(bytes: frame.count, isKeyFrame: isKeyFrame, sequence: payloadSequence, capturedAt: 0, receivedAt: receivedAt)
-            payloadSequence += 1
-            payloadStats.record(bytes: frame.count, isKeyFrame: isKeyFrame)
-          case nil:
-            break
           }
         }
       }
@@ -252,7 +329,7 @@ struct IDBVideo: AsyncParsableCommand {
       guard isatty(STDOUT_FILENO) == 1 else {
         throw ValidationError("--kitty needs stdout to be a terminal")
       }
-      return KittyTerminalOutput(isHEVC: codec == .hevc)
+      return try KittyTerminalOutput(isHEVC: codec == .hevc, showsButtons: !noControl && isatty(STDIN_FILENO) == 1, frameLogPath: kittyLog)
     }
     if output == "-" {
       return FileHandle.standardOutput

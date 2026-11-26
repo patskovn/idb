@@ -121,6 +121,15 @@ let package = Package(
       name: "IDBVideoShm",
       path: "Tools/IDBVideoShm"
     ),
+    // `swift test --filter IDBVideoTests`.
+    .testTarget(
+      name: "IDBVideoTests",
+      dependencies: [
+        "idb-video",
+        "IDBGRPCSwift",
+      ],
+      path: "Tools/IDBVideoTests"
+    ),
     .plugin(
       name: "GenerateBuildInfo",
       capability: .buildTool(),
