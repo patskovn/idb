@@ -14,6 +14,9 @@ import IOSurface
 /// signal only (see `FramebufferSurface`), so a frame-rendered callback carries no dimensions.
 public struct FramebufferStats: Sendable {
   public var frameRenderedCount: UInt = 0
+  /// When the latest frame-rendered callback arrived, as host uptime in nanoseconds
+  /// (`DispatchTime.now().uptimeNanoseconds`); 0 before the first.
+  public var lastFrameRenderedUptimeNanos: UInt64 = 0
   var ioSurfaceChangeCount: UInt = 0
 
   public init() {}

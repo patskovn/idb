@@ -701,7 +701,14 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     }
   }
 
-  func pushFrame(forceKeyFrame requestedKeyFrame: Bool) {
+  /// How often a frame is read from the surface before it is taken as it is. The Simulator draws into the mounted
+  /// surface whenever it has a frame, so a read can straddle two of them; the surface's seed says when one did, and
+  /// the read is done again. One more read is nearly always enough, as the Simulator's frames are milliseconds apart.
+  static let maximumSurfaceReads = 4
+
+  /// `afterRenderedFrame` is set by a push that a frame the Simulator reported triggered, whose delay from that
+  /// report is recorded.
+  func pushFrame(forceKeyFrame requestedKeyFrame: Bool, afterRenderedFrame: Bool = false) {
     guard let pixelBuffer, let consumer, let framePusher else {
       return
     }
@@ -748,29 +755,55 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     let frameDuration = timeAtLastPush > 0 ? (now - timeAtLastPush) : 0
     timeAtLastPush = now
 
-    // The simulator's render server writes into the mounted surface; the lock is advisory, so the
-    // seed is compared across the read to count frames it wrote into anyway. Every read of the
-    // source happens inside this window — the overlay composite and the pusher's colour conversion —
-    // and nothing after it touches the source.
     let sourceSurface = unsafe CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
-    let seedBefore = sourceSurface.map { IOSurfaceGetSeed($0) }
-    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    if afterRenderedFrame {
+      let renderedAt = framebuffer.currentStats().lastFrameRenderedUptimeNanos
+      let readAt = DispatchTime.now().uptimeNanoseconds
+      if renderedAt > 0, readAt >= renderedAt {
+        framePusher.recordCaptureDelay(Double(readAt - renderedAt) / 1e9)
+      }
+    }
 
+    // The simulator's render server writes into the mounted surface, and the lock is advisory: it draws its next
+    // frame whether or not the surface is being read. The surface's seed moves on with every frame it draws, so a
+    // read during which the seed stood still saw one frame whole, and one during which it moved may be part one
+    // frame and part the next. Every read of the source happens inside the pusher's call, the overlay composite
+    // and the colour conversion, and the pusher asks before it encodes; a read that straddled is done again.
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
     do {
-      try framePusher.writeEncodedFrame(
-        compositor.composite(pixelBuffer),
-        frameNumber: frameNumber,
-        timeAtFirstFrame: timeAtFirstFrame,
-        frameDuration: frameDuration,
-        forceKeyFrame: forceKeyFrame)
+      for read in 1...Self.maximumSurfaceReads {
+        let seedBefore = sourceSurface.map { IOSurfaceGetSeed($0) }
+        var asked = false
+        var intact = true
+        let written = try framePusher.writeEncodedFrame(
+          compositor.composite(pixelBuffer),
+          frameNumber: frameNumber,
+          timeAtFirstFrame: timeAtFirstFrame,
+          frameDuration: frameDuration,
+          forceKeyFrame: forceKeyFrame,
+          sourceIsIntact: {
+            asked = true
+            intact = sourceSurface.map { IOSurfaceGetSeed($0) } == seedBefore
+            // The last read is taken as it is: a surface drawn into this often has no still moment to wait for.
+            return intact || read == Self.maximumSurfaceReads
+          })
+        if !written {
+          framePusher.recordReadRedone()
+          continue
+        }
+        if !asked {
+          // A pusher that writes what it read without asking: all that is left is to count it.
+          intact = sourceSurface.map { IOSurfaceGetSeed($0) } == seedBefore
+        }
+        if !intact {
+          framePusher.recordTornFrame()
+        }
+        break
+      }
     } catch {
       logger.log("Failed to submit frame \(frameNumber) for encoding: \(error)")
     }
-
     CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-    if let sourceSurface, let seedBefore, IOSurfaceGetSeed(sourceSurface) != seedBefore {
-      framePusher.recordTornFrame()
-    }
 
     self.frameNumber = frameNumber + 1
   }
@@ -1107,7 +1140,12 @@ public actor SimulatorVideoStream: VideoStreamOperation {
       return nil
     }
     let beforePush = mach_absolute_time()
-    pushFrame(forceKeyFrame: trigger.forceKeyFrame || keyFrameHeldBack)
+    // At a fixed frame rate a push follows the clock, not a frame, so how long after one it reads says nothing.
+    var afterRenderedFrame = false
+    if case .lazy = cadence {
+      afterRenderedFrame = !trigger.overlayOnly
+    }
+    pushFrame(forceKeyFrame: trigger.forceKeyFrame || keyFrameHeldBack, afterRenderedFrame: afterRenderedFrame)
     keyFrameHeldBack = false
     return mach_absolute_time() - beforePush
   }

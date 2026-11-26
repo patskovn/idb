@@ -1163,6 +1163,18 @@ message VideoStreamRequest {
     Transport transport = 8;
     // QUIC only: the UDP port the session listens on. Zero picks a free one.
     uint32 quic_port = 9;
+    // HEVC only: how much colour detail the video keeps. H.264 is always 4:2:0.
+    Chroma chroma = 10;
+  }
+  enum Chroma {
+    // 4:2:0, 8 bits: colour at half the resolution in each direction. Every
+    // HEVC decoder plays it.
+    CHROMA_420 = 0;
+    // 4:4:4, 10 bits (the HEVC Main 4:4:4 10 profile): colour at full
+    // resolution, which keeps coloured text and thin coloured lines sharp. The
+    // decoder must support the profile; Apple silicon decodes it in hardware.
+    // A companion whose encoder does not support it sends 4:2:0.
+    CHROMA_444 = 1;
   }
   message Stop {}
   // Asks for the next encoded frame to be a keyframe, so a client that lost

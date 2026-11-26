@@ -13,12 +13,12 @@ import VideoToolbox
 /// Converts frames to a fixed output size and pixel format on the GPU, in one `VTPixelTransferSession`
 /// pass, recycling the destination buffers through a pool.
 ///
-/// The encoder uses it for BGRA→NV12: `VTCompressionSession`'s native input is NV12, and feeding it
-/// BGRA costs an implicit conversion per frame; converting explicitly also lets the session
-/// pre-allocate its pipeline for the format it will actually receive. The bitmap pusher uses it to
-/// scale BGRA to BGRA.
+/// The encoder uses it for BGRA→YCbCr: `VTCompressionSession`'s native input is bi-planar YCbCr (NV12 for
+/// 4:2:0), and feeding it BGRA costs an implicit conversion per frame that is both slower and less exact;
+/// converting explicitly also lets the session pre-allocate its pipeline for the format it will actually
+/// receive. The bitmap pusher uses it to scale BGRA to BGRA.
 final class PixelBufferConverter {
-  /// The format the encoder is fed: bi-planar 4:2:0, video range.
+  /// The format the encoder is fed for 4:2:0: bi-planar, video range.
   static let encoderPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
   let outputWidth: Int
@@ -89,6 +89,18 @@ final class PixelBufferConverter {
       kCVPixelBufferHeightKey as String: outputHeight,
       kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
     ]
+  }
+
+  /// A buffer from the pool, as `convert` hands them out but with nothing written to it.
+  func makeOutputBuffer() -> CVPixelBuffer? {
+    guard let pool else {
+      return nil
+    }
+    var buffer: CVPixelBuffer?
+    guard unsafe CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess else {
+      return nil
+    }
+    return buffer
   }
 
   /// The converted frame, or a failure the caller decides how to fall back from.

@@ -41,6 +41,25 @@ struct VideoStreamRequestTranslationTests {
     #expect(configuration { $0.keyFrameRate = 2 }.keyFrameRate == 2)
   }
 
+  @Test
+  func aTransportWhoseClientAsksForKeyFramesGetsNoPeriodicOnes() {
+    // QUIC: the client asks for a keyframe when it connects and when it has lost a frame, so an unset rate
+    // means none rather than the default cadence. A rate the client names is still honoured.
+    let unset = VideoStreamRequestTranslation.configuration(from: Idb_VideoStreamRequest.Start(), periodicKeyFrames: false)
+    #expect(unset.keyFrameRate == VideoEncodeOptions.noPeriodicKeyFrames)
+    var named = Idb_VideoStreamRequest.Start()
+    named.keyFrameRate = 2
+    #expect(VideoStreamRequestTranslation.configuration(from: named, periodicKeyFrames: false).keyFrameRate == 2)
+  }
+
+  // MARK: - Chroma
+
+  @Test
+  func chromaIs420UnlessTheRequestAsksFor444() {
+    #expect(configuration().chroma == .subsampled)
+    #expect(configuration { $0.chroma = .chroma444 }.chroma == .full)
+  }
+
   // MARK: - Scale
 
   @Test

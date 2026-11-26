@@ -180,6 +180,48 @@ final class SimulatorVideoStreamPushFrameTests: XCTestCase {
     XCTAssertEqual(stats.tornFrameCount, 1)
   }
 
+  func testAReadTheSimulatorDrewIntoIsDoneAgain() async throws {
+    let started = try await startStream()
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+    let pusher = AskingFramePusher()
+    await started.stream.installFramePusher(pusher)
+    let ioSurface = started.ioSurface
+    // The render server draws its next frame during the first read only.
+    pusher.onRead = { read in
+      guard read == 1 else { return }
+      ioSurface.lock(options: [], seed: nil)
+      ioSurface.baseAddress.assumingMemoryBound(to: UInt8.self)[0] ^= 0xFF
+      ioSurface.unlock(options: [], seed: nil)
+    }
+
+    await started.stream.pushFrame(forceKeyFrame: false)
+
+    XCTAssertEqual(pusher.reads, 2, "the read that straddled two frames must be done again")
+    XCTAssertEqual(pusher.encoded, 1, "only the whole frame is encoded")
+    XCTAssertEqual(pusher.redone, 1)
+    XCTAssertEqual(pusher.torn, 0)
+  }
+
+  func testASurfaceDrawnIntoOnEveryReadIsTakenAsItIsInTheEnd() async throws {
+    let started = try await startStream()
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+    let pusher = AskingFramePusher()
+    await started.stream.installFramePusher(pusher)
+    let ioSurface = started.ioSurface
+    pusher.onRead = { _ in
+      ioSurface.lock(options: [], seed: nil)
+      ioSurface.baseAddress.assumingMemoryBound(to: UInt8.self)[0] ^= 0xFF
+      ioSurface.unlock(options: [], seed: nil)
+    }
+
+    await started.stream.pushFrame(forceKeyFrame: false)
+
+    XCTAssertEqual(pusher.reads, SimulatorVideoStream.maximumSurfaceReads)
+    XCTAssertEqual(pusher.encoded, 1, "a frame must still be pushed when the surface never stands still")
+    XCTAssertEqual(pusher.redone, SimulatorVideoStream.maximumSurfaceReads - 1)
+    XCTAssertEqual(pusher.torn, 1, "and it is counted as torn")
+  }
+
   func testAnOverlayOnlyPushOverThePresentedScreenIsPushed() async throws {
     let started = try await startStream()
     defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
@@ -266,6 +308,58 @@ private final class RecordingFramePusher: FramePusher, @unchecked Sendable {
     if let error {
       throw error
     }
+  }
+}
+
+/// A frame pusher that, like the encoder's, asks whether its source is intact after reading it and encodes only then.
+// SAFETY: every count is guarded by `lock`; `onRead` is set before the push under test.
+// patternlint-disable-next-line unchecked-sendable
+private final class AskingFramePusher: FramePusher, @unchecked Sendable {
+  private let lock = NSLock()
+  private var readCount = 0
+  private var encodedCount = 0
+  private var redoneCount = 0
+  private var tornCount = 0
+  /// Called during each read with its number, starting at 1.
+  var onRead: ((Int) -> Void)?
+
+  var reads: Int { lock.withLock { readCount } }
+  var encoded: Int { lock.withLock { encodedCount } }
+  var redone: Int { lock.withLock { redoneCount } }
+  var torn: Int { lock.withLock { tornCount } }
+
+  func setup(source: VideoFrameSource, edgeInsets: VideoStreamEdgeInsets) throws {}
+
+  func tearDown() throws {}
+
+  func writeEncodedFrame(_ pixelBuffer: CVPixelBuffer, frameNumber: UInt, timeAtFirstFrame: TimeInterval, frameDuration: TimeInterval, forceKeyFrame: Bool) throws {
+    _ = try writeEncodedFrame(
+      pixelBuffer, frameNumber: frameNumber, timeAtFirstFrame: timeAtFirstFrame, frameDuration: frameDuration, forceKeyFrame: forceKeyFrame,
+      sourceIsIntact: { true })
+  }
+
+  func writeEncodedFrame(
+    _ pixelBuffer: CVPixelBuffer, frameNumber: UInt, timeAtFirstFrame: TimeInterval, frameDuration: TimeInterval, forceKeyFrame: Bool,
+    sourceIsIntact: () -> Bool
+  ) throws -> Bool {
+    let read = lock.withLock { () -> Int in
+      readCount += 1
+      return readCount
+    }
+    onRead?(read)
+    guard sourceIsIntact() else {
+      return false
+    }
+    lock.withLock { encodedCount += 1 }
+    return true
+  }
+
+  func recordTornFrame() {
+    lock.withLock { tornCount += 1 }
+  }
+
+  func recordReadRedone() {
+    lock.withLock { redoneCount += 1 }
   }
 }
 

@@ -97,7 +97,9 @@ struct VideoStreamMethodHandler {
     guard start.filePath.isEmpty else {
       throw RPCError(code: .invalidArgument, message: "The QUIC transport streams to the client; it cannot write to file_path")
     }
-    let configuration = VideoStreamRequestTranslation.configuration(from: start)
+    // The client asks for a keyframe when it connects and whenever it has lost a frame, and QUIC delivers the
+    // rest, so a periodic one is only a burst of bytes that every frame after it pays for.
+    let configuration = VideoStreamRequestTranslation.configuration(from: start, periodicKeyFrames: false)
     guard case let .compressedVideo(codec, _) = configuration.format else {
       throw RPCError(code: .invalidArgument, message: "The QUIC transport carries H.264 or HEVC, not \(configuration.format)")
     }

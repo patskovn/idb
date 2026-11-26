@@ -21,14 +21,30 @@ protocol FramePusher: AnyObject {
     frameDuration: TimeInterval,
     forceKeyFrame: Bool
   ) throws
+  /// As `writeEncodedFrame`, for a source that something else may write into while it is read. `sourceIsIntact` is
+  /// asked once, after the pusher has read the source for the last time: when it answers no, the frame is not
+  /// encoded and the result is false, and the caller reads the source again. A pusher that cannot hold a frame back
+  /// writes it regardless and never asks.
+  func writeEncodedFrame(
+    _ pixelBuffer: CVPixelBuffer,
+    frameNumber: UInt,
+    timeAtFirstFrame: TimeInterval,
+    frameDuration: TimeInterval,
+    forceKeyFrame: Bool,
+    sourceIsIntact: () -> Bool
+  ) throws -> Bool
   /// Starts the encoder on a throwaway frame whose output is discarded, so the first frame written does not wait
   /// for it. Called once, after `setup`.
   func warm(with pixelBuffer: CVPixelBuffer) throws
   /// Hands on every frame the encoder still holds, without ending it, so a pusher set aside and taken up again
   /// cannot emit frames older than those written since.
   func completeFrames()
-  /// The source surface changed while the frame was being read; counted in the pusher's stats.
+  /// A frame was written although the source surface changed while it was being read; counted in the pusher's stats.
   func recordTornFrame()
+  /// A read of the source was thrown away and done again because the surface changed under it.
+  func recordReadRedone()
+  /// How long after the Simulator reported a frame it was read from the surface; kept in the pusher's stats.
+  func recordCaptureDelay(_ seconds: TimeInterval)
   func currentStats() -> VideoEncoderStats?
   /// Changes the encoder's average bitrate mid-stream, for rate adaptation. Ignored by pushers
   /// without a bitrate.
@@ -36,10 +52,24 @@ protocol FramePusher: AnyObject {
 }
 
 extension FramePusher {
+  func writeEncodedFrame(
+    _ pixelBuffer: CVPixelBuffer,
+    frameNumber: UInt,
+    timeAtFirstFrame: TimeInterval,
+    frameDuration: TimeInterval,
+    forceKeyFrame: Bool,
+    sourceIsIntact: () -> Bool
+  ) throws -> Bool {
+    try writeEncodedFrame(pixelBuffer, frameNumber: frameNumber, timeAtFirstFrame: timeAtFirstFrame, frameDuration: frameDuration, forceKeyFrame: forceKeyFrame)
+    return true
+  }
+
+  func recordReadRedone() {}
   func setAverageBitRate(_ bitsPerSecond: Int) {}
   func warm(with pixelBuffer: CVPixelBuffer) throws {}
   func completeFrames() {}
   func recordTornFrame() {}
+  func recordCaptureDelay(_ seconds: TimeInterval) {}
   func currentStats() -> VideoEncoderStats? { nil }
 }
 

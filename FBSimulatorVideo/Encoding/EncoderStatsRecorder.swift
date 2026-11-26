@@ -18,7 +18,13 @@ public struct VideoEncoderStats: Sendable {
   public var dropCount: UInt = 0
   var writeFailureCount: UInt = 0
   public var encodeErrorCount: UInt = 0
+  /// Frames written although the surface changed while they were read.
   public var tornFrameCount: UInt = 0
+  /// Reads of the surface thrown away and done again because it changed under them.
+  public var redoneReadCount: UInt = 0
+  /// Frames read for a frame the Simulator reported, and how long after the report each was read.
+  public var captureDelayCount: UInt = 0
+  public var totalCaptureDelaySeconds: TimeInterval = 0
   public var totalEncodedBytes: UInt = 0
   var totalEncodeSubmitSeconds: TimeInterval = 0
 
@@ -135,9 +141,22 @@ final class EncoderStatsRecorder: Sendable {
     return unsafe String(format: "First encode callback received %.1f ms after its frame was submitted", (ContinuousClock.now - firstSubmission).seconds * 1000)
   }
 
-  /// The source surface changed while a frame was being read.
+  /// A frame was written although the source surface changed while it was being read.
   func recordTornFrame() {
     log.update { $0.stats.tornFrameCount += 1 }
+  }
+
+  /// A read of the source surface was done again because the surface changed under it.
+  func recordReadRedone() {
+    log.update { $0.stats.redoneReadCount += 1 }
+  }
+
+  /// How long after the Simulator reported a frame the stream read it from the surface.
+  func recordCaptureDelay(_ seconds: TimeInterval) {
+    log.update { state in
+      state.stats.captureDelayCount += 1
+      state.stats.totalCaptureDelaySeconds += seconds
+    }
   }
 
   // MARK: - Warmup and starvation
@@ -203,21 +222,33 @@ final class EncoderStatsRecorder: Sendable {
     let totalBitrateKbps = totalElapsed > 0 ? Double(current.totalEncodedBytes) * 8.0 / 1000.0 / totalElapsed : 0
     let intervalAvgEncodeMs = intervalCallbacks > 0 ? (intervalEncodeSubmitSeconds / Double(intervalCallbacks)) * 1000.0 : 0
     let totalAvgEncodeMs = current.callbackCount > 0 ? (current.totalEncodeSubmitSeconds / Double(current.callbackCount)) * 1000.0 : 0
+    // Only a stream that pushes when the Simulator reports a frame measures how soon after it reads.
+    let intervalCaptures = current.captureDelayCount - last.captureDelayCount
+    let intervalCaptureDelay =
+      intervalCaptures > 0
+      ? unsafe String(format: ", read %.2f ms after the frame", (current.totalCaptureDelaySeconds - last.totalCaptureDelaySeconds) / Double(intervalCaptures) * 1000.0) as NSString
+      : ""
+    let totalCaptureDelay =
+      current.captureDelayCount > 0
+      ? unsafe String(format: ", read %.2f ms after the frame", current.totalCaptureDelaySeconds / Double(current.captureDelayCount) * 1000.0) as NSString
+      : ""
 
     return unsafe [
       .info(
         String(
           format:
-            "Video stats (interval): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn",
+            "Video stats (interval): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn, %lu reads redone%@",
           intervalCallbacks, intervalDuration, intervalFps, intervalBitrateKbps, intervalAvgEncodeMs,
           current.writeCount - last.writeCount, current.dropCount - last.dropCount, current.writeFailureCount - last.writeFailureCount,
-          current.encodeErrorCount - last.encodeErrorCount, current.tornFrameCount - last.tornFrameCount)),
+          current.encodeErrorCount - last.encodeErrorCount, current.tornFrameCount - last.tornFrameCount,
+          current.redoneReadCount - last.redoneReadCount, intervalCaptureDelay)),
       .info(
         String(
           format:
-            "Video stats (total): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn",
+            "Video stats (total): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn, %lu reads redone%@",
           current.callbackCount, totalElapsed, totalFps, totalBitrateKbps, totalAvgEncodeMs,
-          current.writeCount, current.dropCount, current.writeFailureCount, current.encodeErrorCount, current.tornFrameCount)),
+          current.writeCount, current.dropCount, current.writeFailureCount, current.encodeErrorCount, current.tornFrameCount,
+          current.redoneReadCount, totalCaptureDelay)),
     ]
   }
 }

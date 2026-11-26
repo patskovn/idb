@@ -14,7 +14,9 @@ import IDBGRPCSwift
 /// maps to nil so the framework substitutes its defaults.
 enum VideoStreamRequestTranslation {
 
-  static func configuration(from start: Idb_VideoStreamRequest.Start) -> VideoStreamConfiguration {
+  /// `periodicKeyFrames` is false for a transport whose client asks for the keyframes it needs and loses no
+  /// frames otherwise; a request that names no interval then gets none.
+  static func configuration(from start: Idb_VideoStreamRequest.Start, periodicKeyFrames: Bool = true) -> VideoStreamConfiguration {
     let rateControl: VideoStreamRateControl?
     if start.avgBitrate > 0 {
       rateControl = .bitrate(Int(start.avgBitrate))
@@ -30,7 +32,8 @@ enum VideoStreamRequestTranslation {
       framesPerSecond: start.fps > 0 ? Int(start.fps) : nil,
       rateControl: rateControl,
       scaleFactor: start.scaleFactor > 0 ? start.scaleFactor : nil,
-      keyFrameRate: start.keyFrameRate > 0 ? start.keyFrameRate : nil)
+      keyFrameRate: start.keyFrameRate > 0 ? start.keyFrameRate : (periodicKeyFrames ? nil : VideoEncodeOptions.noPeriodicKeyFrames),
+      chroma: start.chroma == .chroma444 ? .full : .subsampled)
   }
 
   static func format(from requestFormat: Idb_VideoStreamRequest.Format) -> VideoStreamFormat {

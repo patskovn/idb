@@ -33,7 +33,12 @@ final class FramebufferStatsRecorder: Sendable {
   }
 
   func recordFrameRendered() {
-    switch log.updateAndTick({ $0.frameRenderedCount += 1 }).1 {
+    let now = DispatchTime.now().uptimeNanoseconds
+    let tick = log.updateAndTick { stats in
+      stats.frameRenderedCount += 1
+      stats.lastFrameRenderedUptimeNanos = now
+    }
+    switch tick.1 {
     case .started:
       logger.info().log("First frame-rendered callback received")
     case .pending:
