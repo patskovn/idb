@@ -18,7 +18,10 @@ public struct VideoEncoderStats: Sendable {
   public var dropCount: UInt = 0
   var writeFailureCount: UInt = 0
   public var encodeErrorCount: UInt = 0
+  /// Frames written although the surface changed while they were read.
   public var tornFrameCount: UInt = 0
+  /// Reads of the surface thrown away and done again because it changed under them.
+  public var redoneReadCount: UInt = 0
   public var totalEncodedBytes: UInt = 0
   var totalEncodeSubmitSeconds: TimeInterval = 0
 
@@ -135,9 +138,14 @@ final class EncoderStatsRecorder: Sendable {
     return unsafe String(format: "First encode callback received %.1f ms after its frame was submitted", (ContinuousClock.now - firstSubmission).seconds * 1000)
   }
 
-  /// The source surface changed while a frame was being read.
+  /// A frame was written although the source surface changed while it was being read.
   func recordTornFrame() {
     log.update { $0.stats.tornFrameCount += 1 }
+  }
+
+  /// A read of the source surface was done again because the surface changed under it.
+  func recordReadRedone() {
+    log.update { $0.stats.redoneReadCount += 1 }
   }
 
   // MARK: - Warmup and starvation
@@ -208,16 +216,18 @@ final class EncoderStatsRecorder: Sendable {
       .info(
         String(
           format:
-            "Video stats (interval): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn",
+            "Video stats (interval): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn, %lu reads redone",
           intervalCallbacks, intervalDuration, intervalFps, intervalBitrateKbps, intervalAvgEncodeMs,
           current.writeCount - last.writeCount, current.dropCount - last.dropCount, current.writeFailureCount - last.writeFailureCount,
-          current.encodeErrorCount - last.encodeErrorCount, current.tornFrameCount - last.tornFrameCount)),
+          current.encodeErrorCount - last.encodeErrorCount, current.tornFrameCount - last.tornFrameCount,
+          current.redoneReadCount - last.redoneReadCount)),
       .info(
         String(
           format:
-            "Video stats (total): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn",
+            "Video stats (total): %lu callbacks in %.1fs (%.1f fps, %.0f kbps, %.2f ms/frame encode) — %lu written, %lu dropped, %lu write failures, %lu encode errors, %lu torn, %lu reads redone",
           current.callbackCount, totalElapsed, totalFps, totalBitrateKbps, totalAvgEncodeMs,
-          current.writeCount, current.dropCount, current.writeFailureCount, current.encodeErrorCount, current.tornFrameCount)),
+          current.writeCount, current.dropCount, current.writeFailureCount, current.encodeErrorCount, current.tornFrameCount,
+          current.redoneReadCount)),
     ]
   }
 }

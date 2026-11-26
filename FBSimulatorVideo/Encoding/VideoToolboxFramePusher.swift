@@ -190,6 +190,19 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
     frameDuration: TimeInterval,
     forceKeyFrame: Bool
   ) throws {
+    _ = try writeEncodedFrame(
+      pixelBuffer, frameNumber: frameNumber, timeAtFirstFrame: timeAtFirstFrame, frameDuration: frameDuration, forceKeyFrame: forceKeyFrame,
+      sourceIsIntact: { true })
+  }
+
+  func writeEncodedFrame(
+    _ pixelBuffer: CVPixelBuffer,
+    frameNumber: UInt,
+    timeAtFirstFrame: TimeInterval,
+    frameDuration: TimeInterval,
+    forceKeyFrame: Bool,
+    sourceIsIntact: () -> Bool
+  ) throws -> Bool {
     guard let compressionSession else {
       throw VideoToolboxFramePusherError.missingCompressionSession
     }
@@ -219,6 +232,12 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
       frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true]
     }
 
+    // The conversion above was the last read of the source. One that was written into meanwhile is part one frame and
+    // part the next, so it is not encoded; the converted buffer goes back to its pool.
+    guard sourceIsIntact() else {
+      return false
+    }
+
     // `[weak self]`: the session does not retain the pusher, so a strong capture would be a cycle
     // (pusher → session → handler → pusher). The handler may run on a VideoToolbox thread after this
     // call returns (see the class doc).
@@ -241,6 +260,7 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
     if status != 0 {
       throw VideoToolboxFramePusherError.failedToCompress(status: status)
     }
+    return true
   }
 
   /// A keyframe, so the session's next frame need not reference it; that frame is forced to a keyframe anyway.
@@ -276,6 +296,10 @@ final class VideoToolboxFramePusher: FramePusher, @unchecked Sendable {
 
   func recordTornFrame() {
     statsRecorder.recordTornFrame()
+  }
+
+  func recordReadRedone() {
+    statsRecorder.recordReadRedone()
   }
 
   func currentStats() -> VideoEncoderStats? {
