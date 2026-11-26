@@ -44,13 +44,13 @@ final class SimulatorVideoStreamPushFrameTests: XCTestCase {
     return Started(stream: stream, pusher: RecordingFramePusher(), surface: surface, ioSurface: ioSurface, logger: logger)
   }
 
-  private func startStream(clock: any VideoStreamClock = SystemVideoStreamClock()) async throws -> Started {
+  private func startStream(clock: any VideoStreamClock = SystemVideoStreamClock(), consumer: any DataConsumer = AccumulatingBuffer()) async throws -> Started {
     let made = makeStream(clock: clock)
     let stream = made.stream
     let surface = made.surface
     let ioSurface = made.ioSurface
     let logger = made.logger
-    try await stream.startStreaming(AccumulatingBuffer())
+    try await stream.startStreaming(consumer)
     let pusher = RecordingFramePusher()
     await stream.installFramePusher(pusher)
     return Started(stream: stream, pusher: pusher, surface: surface, ioSurface: ioSurface, logger: logger)
@@ -105,6 +105,70 @@ final class SimulatorVideoStreamPushFrameTests: XCTestCase {
     XCTAssertEqual(started.pusher.writes.count, 1)
     let encodeFailureLogs = started.logger.messages.compactMap { $0 as? String }.filter { $0.contains("-12902") }
     XCTAssertEqual(encodeFailureLogs.count, 1, "an encode submission failure must be logged once: \(started.logger.messages)")
+  }
+
+  func testAFrameTheConsumerHadNoRoomForIsPushedOnceItHasRoom() async throws {
+    let consumer = BackedUpConsumer()
+    let started = try await startStream(consumer: consumer)
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+
+    consumer.queued = 5
+    await started.stream.pushFrame(forceKeyFrame: false)
+    XCTAssertEqual(started.pusher.writes.count, 0, "a full consumer is not handed a frame")
+
+    // The screen stays still: nothing but the retry can push its last state.
+    consumer.queued = 0
+    for _ in 0..<200 where started.pusher.writes.isEmpty {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertEqual(started.pusher.writes.count, 1, "the dropped frame must be pushed once there is room")
+    try await Task.sleep(nanoseconds: 150_000_000)
+    XCTAssertEqual(started.pusher.writes.count, 1, "and only once")
+  }
+
+  func testAKeyFrameTheConsumerHadNoRoomForIsOwedToTheNextFrame() async throws {
+    let consumer = BackedUpConsumer()
+    let started = try await startStream(consumer: consumer)
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+
+    consumer.queued = 5
+    await started.stream.pushFrame(forceKeyFrame: true)
+    consumer.queued = 0
+    await started.stream.pushFrame(forceKeyFrame: false)
+    await started.stream.pushFrame(forceKeyFrame: false)
+
+    XCTAssertEqual(started.pusher.writes.map(\.forceKeyFrame), [true, false], "the keyframe asked for while the consumer was full is the next frame pushed")
+  }
+
+  func testAPushThatSucceedsCancelsTheRetryOfAnEarlierDrop() async throws {
+    let consumer = BackedUpConsumer()
+    let started = try await startStream(consumer: consumer)
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+
+    consumer.queued = 5
+    await started.stream.pushFrame(forceKeyFrame: false)
+    consumer.queued = 0
+    await started.stream.pushFrame(forceKeyFrame: false)
+
+    try await Task.sleep(nanoseconds: 200_000_000)
+    XCTAssertEqual(started.pusher.writes.count, 1, "the frame pushed since carries the latest screen, so the retry has nothing to add")
+  }
+
+  func testAFullConsumerIsLoggedWhenItFillsAndWhenItCatchesUp() async throws {
+    let consumer = BackedUpConsumer()
+    let started = try await startStream(consumer: consumer)
+    defer { Task { [stream = started.stream] in try? await stream.stopStreaming() } }
+
+    consumer.queued = 5
+    for _ in 0..<4 {
+      await started.stream.pushFrame(forceKeyFrame: false)
+    }
+    consumer.queued = 0
+    await started.stream.pushFrame(forceKeyFrame: false)
+
+    let messages = started.logger.messages.compactMap { $0 as? String }
+    XCTAssertEqual(messages.filter { $0.contains("Consumer is overflown") }.count, 1, "once when it fills, not for every frame dropped: \(messages)")
+    XCTAssertEqual(messages.filter { $0.contains("Consumer caught up after 4 dropped frames") }.count, 1, "\(messages)")
   }
 
   func testMediaOriginIsUnknownBeforeAFrameWasPushed() async throws {
@@ -255,6 +319,25 @@ final class SimulatorVideoStreamPushFrameTests: XCTestCase {
     // The rendered frame carries the held-back swap's keyframe; once it is presented, overlay-only pushes go ahead
     XCTAssertEqual(started.pusher.writes.map(\.forceKeyFrame), [true, false])
   }
+}
+
+/// A consumer that says how many frames it still holds, as one that sends them over a network does.
+// SAFETY: `queuedFrames` is guarded by `lock`.
+// patternlint-disable-next-line unchecked-sendable
+private final class BackedUpConsumer: DataConsumer, @unchecked Sendable {
+  private let lock = NSLock()
+  private var queuedFrames = 0
+
+  var queued: Int {
+    get { lock.withLock { queuedFrames } }
+    set { lock.withLock { queuedFrames = newValue } }
+  }
+
+  var consumption: DataConsumption { .queued(unprocessed: queued) }
+
+  func consumeData(_ data: Data) {}
+
+  func consumeEndOfFile() {}
 }
 
 /// A frame pusher that records what `pushFrame` hands it and can fail or act on demand.

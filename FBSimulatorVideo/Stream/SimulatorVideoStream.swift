@@ -209,6 +209,16 @@ public actor SimulatorVideoStream: VideoStreamOperation {
   private var presentedSurfaceSeed: UInt32?
   /// Whether the next triggered push must force the keyframe of an overlay swap whose own push was held back
   private var keyFrameHeldBack = false
+  /// A forced keyframe whose frame the consumer had no room for: the next frame pushed is a keyframe,
+  /// so a keyframe request is never lost to backpressure.
+  private var keyFrameOwed = false
+  /// In `.lazy` mode a frame dropped for backpressure is pushed again once there is room, so the last
+  /// state of the screen always reaches the consumer even if the screen then stays still.
+  private var retryAfterDropTask: Task<Void, Never>?
+  /// Retries since the consumer last took a frame; each one waits twice as long, up to 0.5 s.
+  private var retriesSinceLastPush = 0
+  /// Frames dropped since the consumer became full, logged once when it catches up.
+  private var droppedSinceFull: Int?
 
   var pixelBuffer: CVPixelBuffer?
   /// The mounted surface as the interface shows it.
@@ -495,6 +505,8 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     lazyTriggers = nil
     framePusherTask?.cancel()
     framePusherTask = nil
+    retryAfterDropTask?.cancel()
+    retryAfterDropTask = nil
   }
 
   // MARK: - Framebuffer Events
@@ -698,9 +710,30 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     guard let pixelBuffer, let consumer, let framePusher else {
       return
     }
-    if !consumer.hasCapacityForFrame(logger: logger) {
+    // A keyframe asked for while the consumer was full is owed to the next frame it takes.
+    let forceKeyFrame = forceKeyFrame || keyFrameOwed
+    let capacity = consumer.frameCapacity()
+    if !capacity.hasCapacity {
+      // Logged when the consumer becomes full, not on every dropped frame or retry.
+      if let dropped = droppedSinceFull {
+        droppedSinceFull = dropped + 1
+      } else {
+        droppedSinceFull = 1
+        logger.log("Consumer is overflown. Number of unsent frames: \(capacity.queued)")
+      }
+      keyFrameOwed = forceKeyFrame
+      scheduleRetryAfterDrop()
       return
     }
+    if let dropped = droppedSinceFull {
+      logger.log("Consumer caught up after \(dropped) dropped frames")
+      droppedSinceFull = nil
+    }
+    keyFrameOwed = false
+    // This frame carries the latest screen, so a retry scheduled for an earlier drop is not needed.
+    retryAfterDropTask?.cancel()
+    retryAfterDropTask = nil
+    retriesSinceLastPush = 0
 
     // Uptime is monotonic; the wall clock steps under NTP and can hand the encoder (and a file
     // writer) a timestamp earlier than the previous frame's.
@@ -760,6 +793,29 @@ public actor SimulatorVideoStream: VideoStreamOperation {
     CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
 
     self.frameNumber = frameNumber + 1
+  }
+
+  /// A frame dropped because the consumer was full is the latest state of the screen until the Simulator draws
+  /// again, which on a still screen it never does. So the push is tried again: after 33 ms, then twice as long
+  /// each time while the consumer stays full, up to 0.5 s. A stream at a fixed frame rate pushes again by itself.
+  private func scheduleRetryAfterDrop() {
+    guard case .lazy = cadence, retryAfterDropTask == nil else {
+      return
+    }
+    let delay = min(33 << min(retriesSinceLastPush, 4), 500)
+    retriesSinceLastPush += 1
+    retryAfterDropTask = Task { [weak self] in
+      try? await Task.sleep(for: .milliseconds(delay))
+      guard !Task.isCancelled else {
+        return
+      }
+      await self?.retryDroppedFrame()
+    }
+  }
+
+  private func retryDroppedFrame() {
+    retryAfterDropTask = nil
+    pushFrame(forceKeyFrame: false)
   }
 
   /// Lays overlays out on the current canvas from now on, as it changes with rotations and switches between

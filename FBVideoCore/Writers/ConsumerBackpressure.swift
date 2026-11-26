@@ -13,14 +13,20 @@ public extension DataConsumer {
   /// than `maximumQueuedFrames` unprocessed items is behind; the caller should drop the frame rather
   /// than let the queue grow. Synchronous consumers apply their own back-pressure and always accept.
   func hasCapacityForFrame(logger: any ControlCoreLogger) -> Bool {
+    let capacity = frameCapacity()
+    if !capacity.hasCapacity {
+      logger.log("Consumer is overflown. Number of unsent frames: \(capacity.queued)")
+    }
+    return capacity.hasCapacity
+  }
+
+  /// The same check without logging, with the queue length, for callers that log only when the
+  /// consumer becomes full rather than on every dropped frame.
+  func frameCapacity() -> (hasCapacity: Bool, queued: Int) {
     guard case let .queued(queued) = consumption else {
-      return true
+      return (true, 0)
     }
-    if queued > Self.maximumQueuedFrames {
-      logger.log("Consumer is overflown. Number of unsent frames: \(queued)")
-      return false
-    }
-    return true
+    return (queued <= Self.maximumQueuedFrames, queued)
   }
 
   private static var maximumQueuedFrames: Int { 2 }
